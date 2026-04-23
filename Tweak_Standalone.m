@@ -41,10 +41,12 @@ static void addOrReplaceMethod(Class cls, SEL sel, IMP imp, const char *types) {
 // Replacement implementations
 // ============================================================
 
-// DVNCell — setLocked: → always NO
+// DVNCell — setLocked: → always NO (with null-safe orig call)
 static IMP orig_DVNCell_setLocked;
 static void rep_DVNCell_setLocked(id self, SEL _cmd, BOOL locked) {
-    ((void(*)(id, SEL, BOOL))orig_DVNCell_setLocked)(self, _cmd, NO);
+    if (orig_DVNCell_setLocked) {
+        ((void(*)(id, SEL, BOOL))orig_DVNCell_setLocked)(self, _cmd, NO);
+    }
 }
 
 // DVNCell — locked/isLocked → always NO
@@ -60,7 +62,9 @@ static BOOL rep_returnYES(id self, SEL _cmd) {
 // WelcomeVC — viewDidLoad → dismiss immediately
 static IMP orig_WelcomeVC_viewDidLoad;
 static void rep_WelcomeVC_viewDidLoad(id self, SEL _cmd) {
-    ((void(*)(id, SEL))orig_WelcomeVC_viewDidLoad)(self, _cmd);
+    if (orig_WelcomeVC_viewDidLoad) {
+        ((void(*)(id, SEL))orig_WelcomeVC_viewDidLoad)(self, _cmd);
+    }
     // Dismiss the welcome/login screen on next run loop
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *vc = (UIViewController *)self;
@@ -68,20 +72,35 @@ static void rep_WelcomeVC_viewDidLoad(id self, SEL _cmd) {
     });
 }
 
-// YTPSettingsBuilder — patreonSection → nil
-static id rep_returnNil(id self, SEL _cmd) {
-    return nil;
+// YTPSettingsBuilder — patreonSection → call orig, then strip its cells
+// Returning nil crashes because the caller does [array addObject:nil].
+// Instead, let the original run but return an empty section.
+static IMP orig_patreonSection;
+static id rep_patreonSection(id self, SEL _cmd) {
+    id section = nil;
+    if (orig_patreonSection) {
+        section = ((id(*)(id, SEL))orig_patreonSection)(self, _cmd);
+    }
+    // Try to empty the section's cells so nothing renders
+    if (section) {
+        SEL setCells = NSSelectorFromString(@"setCells:");
+        if ([section respondsToSelector:setCells]) {
+            ((void(*)(id, SEL, id))objc_msgSend)(section, setCells, @[]);
+        }
+    }
+    return section;
 }
 
-// patreonButtonCellWithType:model: → nil
-static id rep_returnNil2(id self, SEL _cmd, NSInteger type, id model) {
-    return nil;
-}
+// patreonButtonCellWithType:model: → call orig (return whatever it returns)
+// Returning nil here also crashes if result is inserted into an array.
+// Better to just not hook this at all, since we empty the section above.
 
-// DVNTableViewController — setLocked: → always NO
+// DVNTableViewController — setLocked: → always NO (with null-safe orig call)
 static IMP orig_DVNTVC_setLocked;
 static void rep_DVNTVC_setLocked(id self, SEL _cmd, BOOL locked) {
-    ((void(*)(id, SEL, BOOL))orig_DVNTVC_setLocked)(self, _cmd, NO);
+    if (orig_DVNTVC_setLocked) {
+        ((void(*)(id, SEL, BOOL))orig_DVNTVC_setLocked)(self, _cmd, NO);
+    }
 }
 
 // ============================================================
@@ -130,15 +149,16 @@ static void patcher_init(void) {
         }
 
         // --- YTPSettingsBuilder ---
+        // Don't return nil from patreonSection — that crashes when
+        // inserted into NSMutableArray. Instead, empty its cells.
         Class settingsBuilder = objc_getClass("YTPSettingsBuilder");
         if (settingsBuilder) {
             Method m = class_getInstanceMethod(settingsBuilder,
                            NSSelectorFromString(@"patreonSection"));
-            if (m) method_setImplementation(m, (IMP)rep_returnNil);
-
-            m = class_getInstanceMethod(settingsBuilder,
-                    NSSelectorFromString(@"patreonButtonCellWithType:model:"));
-            if (m) method_setImplementation(m, (IMP)rep_returnNil2);
+            if (m) {
+                orig_patreonSection = method_getImplementation(m);
+                method_setImplementation(m, (IMP)rep_patreonSection);
+            }
         }
 
         // --- DVNTableViewController ---
