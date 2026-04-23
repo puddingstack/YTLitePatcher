@@ -1,74 +1,31 @@
 /*
- * YTLitePatcher
+ * YTLitePatcher v2
  *
- * Patches YTLite's paywall at TWO levels:
+ * Patches YTLite's Patreon paywall on non-jailbroken (sideloaded) iOS.
  *
- * Level 1 — C function binary patch:
- *   _dvnCheck() and _dvnLocked are C functions called INSIDE every
- *   YTLite hook to gate features. We find them via dlsym (they're
- *   exported symbols) and overwrite them in memory with:
- *     MOV W0, #0   (return false/0)
- *     RET
- *   This is the critical patch — without it, features don't execute.
+ * Key findings from reverse engineering:
+ * - _dvnCheck/_dvnLocked are PRIVATE symbols (dlsym can't find them)
+ * - vm_protect on __TEXT pages FAILS on non-jailbroken iOS (code signing)
+ * - The gate is multi-layered: C functions + ObjC properties + isCairo flag
+ * - "cairo" is an obfuscated BOOL property (getter=isCairo) adjacent to
+ *   "locked" — it's the actual "is patron active" flag
  *
- * Level 2 — ObjC runtime swizzle:
- *   DVNCell.setLocked:, DVNPatreonContext auth checks, WelcomeVC,
- *   patreonSection. These fix the settings UI (lock icons, login screen).
+ * Strategy (all ObjC runtime — works without jailbreak):
+ * 1. Force isCairo=YES and locked=NO on all DVN classes
+ * 2. Force locked=NO on DVNCell
+ * 3. Force all DVNPatreonContext auth checks to return YES
+ * 4. Suppress WelcomeVC login screen
+ * 5. Empty the patreonSection cells
+ * 6. Hook cellExistsInModel:target: to always return YES
  */
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <dlfcn.h>
-#import <mach/mach.h>
-#import <libkern/OSCacheControl.h>
 
 // ============================================================
-// C function binary patcher
-// Overwrites a function's first 8 bytes with:
-//   MOV W0, #0  (0x52800000)  — return value = 0 / NO / false
-//   RET          (0xD65F03C0)
-// ============================================================
-static void patchFunctionToReturnNO(void *funcAddr) {
-    if (!funcAddr) return;
-
-    // ARM64 machine code: MOV W0, #0; RET
-    uint8_t patch[] = {
-        0x00, 0x00, 0x80, 0x52,  // MOV W0, #0
-        0xC0, 0x03, 0x5F, 0xD6   // RET
-    };
-
-    // Get the page-aligned address
-    vm_size_t pageSize = 0;
-    host_page_size(mach_host_self(), &pageSize);
-    if (pageSize == 0) pageSize = 16384; // fallback for iOS
-    uintptr_t pageStart = (uintptr_t)funcAddr & ~(pageSize - 1);
-
-    // Make the page writable (VM_PROT_COPY enables COW)
-    kern_return_t kr = vm_protect(mach_task_self(),
-                                  (vm_address_t)pageStart,
-                                  pageSize,
-                                  false,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) return;
-
-    // Write the patch
-    memcpy(funcAddr, patch, sizeof(patch));
-
-    // Restore executable permission
-    vm_protect(mach_task_self(),
-               (vm_address_t)pageStart,
-               pageSize,
-               false,
-               VM_PROT_READ | VM_PROT_EXECUTE);
-
-    // Flush instruction cache so CPU sees the new code
-    sys_icache_invalidate(funcAddr, sizeof(patch));
-}
-
-// ============================================================
-// ObjC runtime swizzle helpers
+// Helpers
 // ============================================================
 static void swizzleMethod(Class cls, SEL original, IMP replacement, IMP *store) {
     Method method = class_getInstanceMethod(cls, original);
@@ -78,18 +35,27 @@ static void swizzleMethod(Class cls, SEL original, IMP replacement, IMP *store) 
     }
 }
 
-static void addOrReplaceMethod(Class cls, SEL sel, IMP imp, const char *types) {
-    if (!class_addMethod(cls, sel, imp, types)) {
-        Method m = class_getInstanceMethod(cls, sel);
-        if (m) method_setImplementation(m, imp);
+static void forceMethodToReturnYES(Class cls, SEL sel) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (m) {
+        method_setImplementation(m,
+            imp_implementationWithBlock(^BOOL(id self) { return YES; }));
+    }
+}
+
+static void forceMethodToReturnNO(Class cls, SEL sel) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (m) {
+        method_setImplementation(m,
+            imp_implementationWithBlock(^BOOL(id self) { return NO; }));
     }
 }
 
 // ============================================================
-// Replacement implementations
+// Replacement functions
 // ============================================================
 
-// DVNCell — setLocked: → always NO (with null-safe orig call)
+// setLocked: → always store NO
 static IMP orig_DVNCell_setLocked;
 static void rep_DVNCell_setLocked(id self, SEL _cmd, BOOL locked) {
     if (orig_DVNCell_setLocked) {
@@ -97,39 +63,32 @@ static void rep_DVNCell_setLocked(id self, SEL _cmd, BOOL locked) {
     }
 }
 
-// DVNCell — locked/isLocked → always NO
-static BOOL rep_returnNO(id self, SEL _cmd) {
-    return NO;
+// setCairo: → always store YES
+static IMP orig_setCairo;
+static void rep_setCairo(id self, SEL _cmd, BOOL cairo) {
+    if (orig_setCairo) {
+        ((void(*)(id, SEL, BOOL))orig_setCairo)(self, _cmd, YES);
+    }
 }
 
-// DVNPatreonContext — isAuthorized/isLoggedIn → always YES
-static BOOL rep_returnYES(id self, SEL _cmd) {
-    return YES;
-}
-
-// WelcomeVC — viewDidLoad → dismiss immediately
+// WelcomeVC viewDidLoad → auto-dismiss
 static IMP orig_WelcomeVC_viewDidLoad;
 static void rep_WelcomeVC_viewDidLoad(id self, SEL _cmd) {
     if (orig_WelcomeVC_viewDidLoad) {
         ((void(*)(id, SEL))orig_WelcomeVC_viewDidLoad)(self, _cmd);
     }
-    // Dismiss the welcome/login screen on next run loop
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *vc = (UIViewController *)self;
-        [vc dismissViewControllerAnimated:NO completion:nil];
+        [(UIViewController *)self dismissViewControllerAnimated:NO completion:nil];
     });
 }
 
-// YTPSettingsBuilder — patreonSection → call orig, then strip its cells
-// Returning nil crashes because the caller does [array addObject:nil].
-// Instead, let the original run but return an empty section.
+// patreonSection → empty its cells (returning nil crashes)
 static IMP orig_patreonSection;
 static id rep_patreonSection(id self, SEL _cmd) {
     id section = nil;
     if (orig_patreonSection) {
         section = ((id(*)(id, SEL))orig_patreonSection)(self, _cmd);
     }
-    // Try to empty the section's cells so nothing renders
     if (section) {
         SEL setCells = NSSelectorFromString(@"setCells:");
         if ([section respondsToSelector:setCells]) {
@@ -139,55 +98,29 @@ static id rep_patreonSection(id self, SEL _cmd) {
     return section;
 }
 
-// patreonButtonCellWithType:model: → call orig (return whatever it returns)
-// Returning nil here also crashes if result is inserted into an array.
-// Better to just not hook this at all, since we empty the section above.
-
-// DVNTableViewController — setLocked: → always NO (with null-safe orig call)
-static IMP orig_DVNTVC_setLocked;
-static void rep_DVNTVC_setLocked(id self, SEL _cmd, BOOL locked) {
-    if (orig_DVNTVC_setLocked) {
-        ((void(*)(id, SEL, BOOL))orig_DVNTVC_setLocked)(self, _cmd, NO);
-    }
-}
-
 // ============================================================
-// Constructor — runs when dylib is loaded
+// Constructor
 // ============================================================
 __attribute__((constructor))
 static void patcher_init(void) {
     @autoreleasepool {
-        // ==========================================================
-        // LEVEL 1: Patch the C gate functions (_dvnCheck / _dvnLocked)
-        // These are called inside every YTLite hook to check if
-        // the user is a Patron. Without this, features don't work.
-        // ==========================================================
-        void *dvnCheck = dlsym(RTLD_DEFAULT, "_dvnCheck");
-        void *dvnLocked = dlsym(RTLD_DEFAULT, "_dvnLocked");
-
-        if (dvnCheck)  patchFunctionToReturnNO(dvnCheck);
-        if (dvnLocked) patchFunctionToReturnNO(dvnLocked);
 
         // ==========================================================
-        // LEVEL 2: ObjC runtime hooks (settings UI, lock icons, etc.)
+        // 1. DVNCell — force all cells unlocked
         // ==========================================================
-
-        // --- DVNCell ---
         Class dvnCell = objc_getClass("DVNCell");
         if (dvnCell) {
             swizzleMethod(dvnCell, @selector(setLocked:),
                           (IMP)rep_DVNCell_setLocked, &orig_DVNCell_setLocked);
-
-            addOrReplaceMethod(dvnCell, @selector(isLocked),
-                               (IMP)rep_returnNO, "B@:");
-            addOrReplaceMethod(dvnCell, @selector(locked),
-                               (IMP)rep_returnNO, "B@:");
+            forceMethodToReturnNO(dvnCell, @selector(isLocked));
+            forceMethodToReturnNO(dvnCell, @selector(locked));
         }
 
-        // --- DVNPatreonContext ---
+        // ==========================================================
+        // 2. DVNPatreonContext — all auth checks → YES
+        // ==========================================================
         Class patreonCtx = objc_getClass("DVNPatreonContext");
         if (patreonCtx) {
-            // Try all common auth-check selector names
             SEL authSels[] = {
                 @selector(isAuthorized),
                 @selector(isAuthenticated),
@@ -195,25 +128,25 @@ static void patcher_init(void) {
                 @selector(isActive),
                 NSSelectorFromString(@"isPatron"),
                 NSSelectorFromString(@"hasActiveSubscription"),
+                NSSelectorFromString(@"isCairo"),
             };
             for (int i = 0; i < sizeof(authSels)/sizeof(authSels[0]); i++) {
-                if (authSels[i] && class_getInstanceMethod(patreonCtx, authSels[i])) {
-                    addOrReplaceMethod(patreonCtx, authSels[i],
-                                       (IMP)rep_returnYES, "B@:");
-                }
+                if (authSels[i]) forceMethodToReturnYES(patreonCtx, authSels[i]);
             }
         }
 
-        // --- WelcomeVC ---
+        // ==========================================================
+        // 3. WelcomeVC — auto-dismiss
+        // ==========================================================
         Class welcomeVC = objc_getClass("WelcomeVC");
         if (welcomeVC) {
             swizzleMethod(welcomeVC, @selector(viewDidLoad),
                           (IMP)rep_WelcomeVC_viewDidLoad, &orig_WelcomeVC_viewDidLoad);
         }
 
-        // --- YTPSettingsBuilder ---
-        // Don't return nil from patreonSection — that crashes when
-        // inserted into NSMutableArray. Instead, empty its cells.
+        // ==========================================================
+        // 4. YTPSettingsBuilder — empty patreon section
+        // ==========================================================
         Class settingsBuilder = objc_getClass("YTPSettingsBuilder");
         if (settingsBuilder) {
             Method m = class_getInstanceMethod(settingsBuilder,
@@ -224,15 +157,66 @@ static void patcher_init(void) {
             }
         }
 
-        // --- DVNTableViewController ---
-        Class dvnTVC = objc_getClass("DVNTableViewController");
-        if (dvnTVC) {
-            Method m = class_getInstanceMethod(dvnTVC, @selector(setLocked:));
+        // ==========================================================
+        // 5. DVNTableModel — cellExistsInModel:target: → always YES
+        //    Key gating point controlling whether feature cells render
+        // ==========================================================
+        Class dvnModel = objc_getClass("DVNTableModel");
+        if (dvnModel) {
+            SEL cellExists = NSSelectorFromString(@"cellExistsInModel:target:");
+            Method m = class_getInstanceMethod(dvnModel, cellExists);
             if (m) {
-                swizzleMethod(dvnTVC, @selector(setLocked:),
-                              (IMP)rep_DVNTVC_setLocked, &orig_DVNTVC_setLocked);
+                method_setImplementation(m,
+                    imp_implementationWithBlock(^BOOL(id s, id model, id target){
+                        return YES;
+                    }));
             }
         }
 
+        // ==========================================================
+        // 6. Shotgun: force isCairo=YES, locked=NO on ALL known classes
+        //    "cairo" is the obfuscated "is patron active" boolean,
+        //    found adjacent to "locked" in the binary's property metadata
+        // ==========================================================
+        SEL isCairoSel = NSSelectorFromString(@"isCairo");
+        SEL setCairoSel = NSSelectorFromString(@"setCairo:");
+
+        const char *classNames[] = {
+            "DVNTableViewController", "DVNCell", "DVNTableModel",
+            "DVNSection", "DVNSupportersVC", "DVNSheetPresenter",
+            "YTPSettingsBuilder", "TabbarVC", "YTLHelper",
+            "InitWorkaround", "Dvbug", "YTPPlayerHelper",
+            "YTPDownloader", "SBManager",
+            NULL
+        };
+
+        for (int i = 0; classNames[i] != NULL; i++) {
+            Class cls = objc_getClass(classNames[i]);
+            if (!cls) continue;
+
+            // isCairo → YES (force patron active)
+            forceMethodToReturnYES(cls, isCairoSel);
+
+            // setCairo: → always store YES
+            Method m = class_getInstanceMethod(cls, setCairoSel);
+            if (m) {
+                orig_setCairo = method_getImplementation(m);
+                method_setImplementation(m, (IMP)rep_setCairo);
+            }
+
+            // locked/isLocked → NO
+            forceMethodToReturnNO(cls, @selector(locked));
+            forceMethodToReturnNO(cls, @selector(isLocked));
+
+            // setLocked: → always NO
+            m = class_getInstanceMethod(cls, @selector(setLocked:));
+            if (m) {
+                method_setImplementation(m,
+                    imp_implementationWithBlock(^(id s, BOOL v){
+                        Ivar iv = class_getInstanceVariable(object_getClass(s), "_locked");
+                        if (iv) object_setIvar(s, iv, (id)(uintptr_t)0);
+                    }));
+            }
+        }
     }
 }
