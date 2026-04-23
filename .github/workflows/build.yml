@@ -1,0 +1,132 @@
+name: Build Patched YouTube Plus
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "URL to the decrypted YouTube IPA"
+        default: ""
+        required: true
+        type: string
+
+      tweak_version:
+        description: "YTLite version (from dayanch96/YTLite/releases)"
+        default: "5.2"
+        required: true
+        type: string
+
+      enable_youpip:
+        description: "Integrate YouPiP"
+        type: boolean
+        default: false
+
+      enable_ryd:
+        description: "Integrate Return YouTube Dislikes"
+        type: boolean
+        default: false
+
+      enable_ytuhd:
+        description: "Integrate YTUHD"
+        type: boolean
+        default: false
+
+      display_name:
+        description: "App display name"
+        default: "YouTube"
+        type: string
+
+      bundle_id:
+        description: "Bundle ID"
+        default: "com.google.ios.youtube"
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Patched IPA
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      # ── 1. Checkout this repo (contains YTLitePatcher source) ──
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Download the YTLite .deb from upstream releases ──
+      - name: Download YTLite deb
+        run: |
+          deb_url="https://github.com/dayanch96/YTLite/releases/download/v${{ inputs.tweak_version }}/com.dvntm.ytlite_${{ inputs.tweak_version }}_iphoneos-arm.deb"
+          echo "Downloading: $deb_url"
+          wget "$deb_url" --no-verbose -O ytplus.deb
+
+      # ── 3. Download and validate the YouTube IPA ──
+      - name: Download YouTube IPA
+        run: |
+          wget "${{ inputs.ipa_url }}" --no-verbose -O youtube.ipa
+          file_type=$(file --mime-type -b youtube.ipa)
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            echo "::error::Not a valid IPA. Type: $file_type"
+            exit 1
+          fi
+
+      # ── 4. Compile YTLitePatcher as a standalone .dylib ──
+      - name: Compile YTLitePatcher
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "Using SDK: $SDK"
+
+          clang -arch arm64 -arch arm64e \
+            -dynamiclib \
+            -isysroot "$SDK" \
+            -target arm64-apple-ios13.0 \
+            -framework Foundation \
+            -framework UIKit \
+            -fobjc-arc \
+            -O2 \
+            -o YTLitePatcher.dylib \
+            Tweak_Standalone.m
+
+          # Sign with ad-hoc signature
+          codesign -f -s - YTLitePatcher.dylib
+
+          echo "Compiled YTLitePatcher.dylib:"
+          file YTLitePatcher.dylib
+          ls -la YTLitePatcher.dylib
+
+      # ── 5. Install cyan (pyzule-rw) for IPA injection ──
+      - name: Install cyan
+        run: pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+
+      # ── 6. Inject everything into the IPA ──
+      - name: Inject tweaks into IPA
+        run: |
+          # Build the injection list:
+          #   ytplus.deb      = YTLite (the main tweak)
+          #   YTLitePatcher.dylib = our patcher (hooks YTLite's paywall)
+          tweaks="ytplus.deb YTLitePatcher.dylib"
+
+          echo "Injecting: $tweaks"
+          cyan -i youtube.ipa \
+               -o YouTubePlus_Patched_${{ inputs.tweak_version }}.ipa \
+               -uwef $tweaks \
+               -n "${{ inputs.display_name }}" \
+               -b "${{ inputs.bundle_id }}"
+
+          echo "Output IPA:"
+          ls -la YouTubePlus_Patched_*.ipa
+
+      # ── 7. Upload as GitHub Release (draft) ──
+      - name: Upload to Releases
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: patched-${{ github.run_number }}
+          name: "YouTubePlus Patched v${{ inputs.tweak_version }} (#${{ github.run_number }})"
+          files: YouTubePlus_Patched_${{ inputs.tweak_version }}.ipa
+          draft: true
+
+      - name: Done
+        run: echo "::notice::Release at https://github.com/${{ github.repository }}/releases"
