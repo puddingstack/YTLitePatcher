@@ -18,6 +18,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
 // ============================================================
 // ObjC runtime swizzle helper
