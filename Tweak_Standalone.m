@@ -151,18 +151,5 @@ static void patcher_init(void) {
             }
         }
 
-        // --- Also try hooking the C functions via dlsym ---
-        // _dvnCheck and _dvnLocked are exported symbols
-        void *handle = dlopen(NULL, RTLD_NOW);
-        if (handle) {
-            // Try to find and override _dvnCheck
-            BOOL (*dvnCheckPtr)(void) = (BOOL(*)(void))dlsym(handle, "_dvnCheck");
-            if (dvnCheckPtr) {
-                // Can't easily MSHookFunction without Substrate,
-                // but we've already covered the ObjC side above.
-                // If using Substrate, MSHookFunction would go here.
-            }
-            dlclose(handle);
-        }
     }
 }

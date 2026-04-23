@@ -68,7 +68,6 @@ jobs:
 
     env:
       THEOS: ${{ github.workspace }}/theos
-      ANY_TWEAK: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_ytabc || inputs.enable_demc }}
 
     steps:
       # ── Checkout (our patcher source) ──
@@ -98,7 +97,7 @@ jobs:
           clang -arch arm64 -arch arm64e \
             -dynamiclib \
             -isysroot "$SDK" \
-            -target arm64-apple-ios13.0 \
+            -miphoneos-version-min=13.0 \
             -framework Foundation \
             -framework UIKit \
             -fobjc-arc \
@@ -116,9 +115,11 @@ jobs:
         if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_ytabc || inputs.enable_demc }}
         run: brew install make ldid dpkg
 
-      - name: Set PATH
+      - name: Set PATH and THEOS env
         if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_ytabc || inputs.enable_demc }}
-        run: echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+        run: |
+          echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+          echo "THEOS=${{ github.workspace }}/theos" >> $GITHUB_ENV
 
       - name: Cache Theos
         if: ${{ inputs.enable_youpip || inputs.enable_ytuhd || inputs.enable_yq || inputs.enable_ryd || inputs.enable_ytabc || inputs.enable_demc }}
