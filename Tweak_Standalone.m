@@ -1,27 +1,74 @@
 /*
- * YTLitePatcher — Minimal variant
+ * YTLitePatcher
  *
- * Alternative approach: Instead of hooking C functions,
- * this version focuses purely on ObjC runtime swizzling
- * which is more portable and doesn't require MSFindSymbol.
+ * Patches YTLite's paywall at TWO levels:
  *
- * Strategy:
- * 1. Swizzle DVNCell.setLocked: to always pass NO
- * 2. Swizzle any isAuthorized/isLoggedIn on DVNPatreonContext
- * 3. Block WelcomeVC from presenting
- * 4. Remove patreon section from settings
+ * Level 1 — C function binary patch:
+ *   _dvnCheck() and _dvnLocked are C functions called INSIDE every
+ *   YTLite hook to gate features. We find them via dlsym (they're
+ *   exported symbols) and overwrite them in memory with:
+ *     MOV W0, #0   (return false/0)
+ *     RET
+ *   This is the critical patch — without it, features don't execute.
  *
- * This can be compiled as a standalone dylib and injected
- * into the YouTube IPA alongside YTLite using cyan/pyzule.
+ * Level 2 — ObjC runtime swizzle:
+ *   DVNCell.setLocked:, DVNPatreonContext auth checks, WelcomeVC,
+ *   patreonSection. These fix the settings UI (lock icons, login screen).
  */
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <dlfcn.h>
+#import <mach/mach.h>
+#import <libkern/OSCacheControl.h>
 
 // ============================================================
-// ObjC runtime swizzle helper
+// C function binary patcher
+// Overwrites a function's first 8 bytes with:
+//   MOV W0, #0  (0x52800000)  — return value = 0 / NO / false
+//   RET          (0xD65F03C0)
+// ============================================================
+static void patchFunctionToReturnNO(void *funcAddr) {
+    if (!funcAddr) return;
+
+    // ARM64 machine code: MOV W0, #0; RET
+    uint8_t patch[] = {
+        0x00, 0x00, 0x80, 0x52,  // MOV W0, #0
+        0xC0, 0x03, 0x5F, 0xD6   // RET
+    };
+
+    // Get the page-aligned address
+    vm_size_t pageSize = 0;
+    host_page_size(mach_host_self(), &pageSize);
+    if (pageSize == 0) pageSize = 16384; // fallback for iOS
+    uintptr_t pageStart = (uintptr_t)funcAddr & ~(pageSize - 1);
+
+    // Make the page writable (VM_PROT_COPY enables COW)
+    kern_return_t kr = vm_protect(mach_task_self(),
+                                  (vm_address_t)pageStart,
+                                  pageSize,
+                                  false,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) return;
+
+    // Write the patch
+    memcpy(funcAddr, patch, sizeof(patch));
+
+    // Restore executable permission
+    vm_protect(mach_task_self(),
+               (vm_address_t)pageStart,
+               pageSize,
+               false,
+               VM_PROT_READ | VM_PROT_EXECUTE);
+
+    // Flush instruction cache so CPU sees the new code
+    sys_icache_invalidate(funcAddr, sizeof(patch));
+}
+
+// ============================================================
+// ObjC runtime swizzle helpers
 // ============================================================
 static void swizzleMethod(Class cls, SEL original, IMP replacement, IMP *store) {
     Method method = class_getInstanceMethod(cls, original);
@@ -110,6 +157,21 @@ static void rep_DVNTVC_setLocked(id self, SEL _cmd, BOOL locked) {
 __attribute__((constructor))
 static void patcher_init(void) {
     @autoreleasepool {
+        // ==========================================================
+        // LEVEL 1: Patch the C gate functions (_dvnCheck / _dvnLocked)
+        // These are called inside every YTLite hook to check if
+        // the user is a Patron. Without this, features don't work.
+        // ==========================================================
+        void *dvnCheck = dlsym(RTLD_DEFAULT, "_dvnCheck");
+        void *dvnLocked = dlsym(RTLD_DEFAULT, "_dvnLocked");
+
+        if (dvnCheck)  patchFunctionToReturnNO(dvnCheck);
+        if (dvnLocked) patchFunctionToReturnNO(dvnLocked);
+
+        // ==========================================================
+        // LEVEL 2: ObjC runtime hooks (settings UI, lock icons, etc.)
+        // ==========================================================
+
         // --- DVNCell ---
         Class dvnCell = objc_getClass("DVNCell");
         if (dvnCell) {
