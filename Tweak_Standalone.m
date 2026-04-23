@@ -208,13 +208,12 @@ static void patcher_init(void) {
             forceMethodToReturnNO(cls, @selector(locked));
             forceMethodToReturnNO(cls, @selector(isLocked));
 
-            // setLocked: → always NO
+            // setLocked: → always NO (just call orig with NO)
             m = class_getInstanceMethod(cls, @selector(setLocked:));
             if (m) {
                 method_setImplementation(m,
                     imp_implementationWithBlock(^(id s, BOOL v){
-                        Ivar iv = class_getInstanceVariable(object_getClass(s), "_locked");
-                        if (iv) object_setIvar(s, iv, (id)(uintptr_t)0);
+                        // Getter already returns NO, so just do nothing
                     }));
             }
         }
