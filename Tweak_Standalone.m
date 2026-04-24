@@ -92,7 +92,7 @@ static NSData *hook_elementData(id self, SEL _cmd) {
         }
     }
     
-    // Check description for ad types
+    // Use description as identifier — EXACT match only (containsObject, not containsString)
     NSString *desc = [self description];
     NSArray *adTypes = @[@"brand_promo", @"product_carousel", @"product_engagement_panel",
                          @"product_item", @"text_search_ad", @"text_image_button_layout",
@@ -100,10 +100,8 @@ static NSData *hook_elementData(id self, SEL _cmd) {
                          @"square_image_layout", @"landscape_image_wide_button_layout",
                          @"feed_ad_metadata"];
     
-    for (NSString *ad in adTypes) {
-        if ([desc containsString:ad]) {
-            return [NSData data];
-        }
+    if ([adTypes containsObject:desc]) {
+        return [NSData data];
     }
     
     return ((NSData *(*)(id, SEL))orig_elementData)(self, _cmd);
@@ -111,36 +109,44 @@ static NSData *hook_elementData(id self, SEL _cmd) {
 
 // YTSectionListViewController -loadWithModel: → remove promoted content
 static void hook_loadWithModel(id self, SEL _cmd, id model) {
-    // Remove promoted video renderers from section list
-    SEL contentsArraySel = NSSelectorFromString(@"contentsArray");
-    if ([model respondsToSelector:contentsArraySel]) {
-        NSMutableArray *contentsArray = ((id(*)(id, SEL))objc_msgSend)(model, contentsArraySel);
-        if ([contentsArray isKindOfClass:[NSMutableArray class]]) {
-            NSIndexSet *removeIndexes = [contentsArray indexesOfObjectsPassingTest:
-                ^BOOL(id renderers, NSUInteger idx, BOOL *stop) {
+    // Remove promoted video renderers from section list BEFORE calling orig
+    @try {
+        SEL contentsArraySel = NSSelectorFromString(@"contentsArray");
+        if (model && [model respondsToSelector:contentsArraySel]) {
+            NSMutableArray *contentsArray = ((id(*)(id, SEL))objc_msgSend)(model, contentsArraySel);
+            if ([contentsArray isKindOfClass:[NSMutableArray class]] && contentsArray.count > 0) {
+                NSMutableIndexSet *removeIndexes = [NSMutableIndexSet indexSet];
+                [contentsArray enumerateObjectsUsingBlock:^(id renderers, NSUInteger idx, BOOL *stop) {
                     SEL itemSec = NSSelectorFromString(@"itemSectionRenderer");
-                    if (![renderers respondsToSelector:itemSec]) return NO;
+                    if (![renderers respondsToSelector:itemSec]) return;
                     id sectionRenderer = ((id(*)(id, SEL))objc_msgSend)(renderers, itemSec);
-                    if (!sectionRenderer) return NO;
+                    if (!sectionRenderer) return;
                     
                     SEL contentsSel = NSSelectorFromString(@"contentsArray");
-                    if (![sectionRenderer respondsToSelector:contentsSel]) return NO;
+                    if (![sectionRenderer respondsToSelector:contentsSel]) return;
                     NSArray *contents = ((id(*)(id, SEL))objc_msgSend)(sectionRenderer, contentsSel);
                     id firstObject = [contents firstObject];
-                    if (!firstObject) return NO;
+                    if (!firstObject) return;
                     
                     SEL hasPromo = NSSelectorFromString(@"hasPromotedVideoRenderer");
                     SEL hasCompactPromo = NSSelectorFromString(@"hasCompactPromotedVideoRenderer");
                     SEL hasInlineMuted = NSSelectorFromString(@"hasPromotedVideoInlineMutedRenderer");
                     
-                    return ([firstObject respondsToSelector:hasPromo] && ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, hasPromo)) ||
-                           ([firstObject respondsToSelector:hasCompactPromo] && ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, hasCompactPromo)) ||
-                           ([firstObject respondsToSelector:hasInlineMuted] && ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, hasInlineMuted));
+                    BOOL isPromo = ([firstObject respondsToSelector:hasPromo] && ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, hasPromo)) ||
+                                   ([firstObject respondsToSelector:hasCompactPromo] && ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, hasCompactPromo)) ||
+                                   ([firstObject respondsToSelector:hasInlineMuted] && ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, hasInlineMuted));
+                    if (isPromo) [removeIndexes addIndex:idx];
                 }];
-            [contentsArray removeObjectsAtIndexes:removeIndexes];
+                if (removeIndexes.count > 0) {
+                    [contentsArray removeObjectsAtIndexes:removeIndexes];
+                }
+            }
         }
+    } @catch (NSException *e) {
+        // Silently ignore — don't crash the feed
     }
     
+    // Always call original
     if (orig_loadWithModel) {
         ((void(*)(id, SEL, id))orig_loadWithModel)(self, _cmd, model);
     }
