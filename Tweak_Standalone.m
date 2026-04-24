@@ -231,13 +231,6 @@ static void dyld_image_added(const struct mach_header *mh, intptr_t slide) {
     });
 }
 
-    // Defer 1 second so YTLite's constructor completes first
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{
-        registerAllHooks();
-    });
-}
-
 // ============================================================
 // Constructor
 // ============================================================
