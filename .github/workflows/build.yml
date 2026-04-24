@@ -82,7 +82,7 @@ jobs:
 
       # ── Static binary patch: zero out _dvnCheck/_dvnLocked in YTLite.dylib ──
       - name: Install LIEF
-        run: pip3 install lief
+        run: pip3 install --break-system-packages lief
 
       - name: Static patch YTLite.dylib (zero _dvnCheck/_dvnLocked)
         run: |
