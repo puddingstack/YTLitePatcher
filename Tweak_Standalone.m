@@ -65,106 +65,183 @@ static void hook_decorateContext(id self, SEL _cmd, id ctx) {
     // Don't decorate with ad context
 }
 
-// YTSectionListViewController -loadWithModel: → filter promoted sections AND individual ad items
+// Helper: recursively check an object and its children for ad indicators
+static BOOL isAdRelated(id obj) {
+    if (!obj) return NO;
+
+    // Check promoted video renderer types
+    static NSArray *adSelNames = nil;
+    static dispatch_once_t onceToken1;
+    dispatch_once(&onceToken1, ^{
+        adSelNames = @[
+            @"hasPromotedVideoRenderer",
+            @"hasCompactPromotedVideoRenderer",
+            @"hasPromotedVideoInlineMutedRenderer",
+            @"hasAdLoggingData",
+        ];
+    });
+
+    for (NSString *selName in adSelNames) {
+        SEL sel = NSSelectorFromString(selName);
+        if ([obj respondsToSelector:sel] &&
+            ((BOOL(*)(id, SEL))objc_msgSend)(obj, sel)) {
+            return YES;
+        }
+    }
+
+    // Check compatibilityOptions → hasAdLoggingData
+    SEL hasCompat = NSSelectorFromString(@"hasCompatibilityOptions");
+    SEL compatOpts = NSSelectorFromString(@"compatibilityOptions");
+    SEL hasAdLog = NSSelectorFromString(@"hasAdLoggingData");
+    if ([obj respondsToSelector:hasCompat] &&
+        ((BOOL(*)(id, SEL))objc_msgSend)(obj, hasCompat)) {
+        id opts = ((id(*)(id, SEL))objc_msgSend)(obj, compatOpts);
+        if (opts && [opts respondsToSelector:hasAdLog] &&
+            ((BOOL(*)(id, SEL))objc_msgSend)(opts, hasAdLog)) {
+            return YES;
+        }
+    }
+
+    // Check elementRenderer if available
+    SEL elemSel = NSSelectorFromString(@"elementRenderer");
+    if ([obj respondsToSelector:elemSel]) {
+        id elem = ((id(*)(id, SEL))objc_msgSend)(obj, elemSel);
+        if (elem && isAdRelated(elem)) return YES;
+    }
+
+    return NO;
+}
+
+// Helper: get contentsArray from any renderer type
+static NSMutableArray *getContentsArray(id renderer) {
+    if (!renderer) return nil;
+    SEL sel = NSSelectorFromString(@"contentsArray");
+    if ([renderer respondsToSelector:sel]) {
+        id arr = ((id(*)(id, SEL))objc_msgSend)(renderer, sel);
+        if ([arr isKindOfClass:[NSMutableArray class]]) return arr;
+    }
+    return nil;
+}
+
+// YTSectionListViewController -loadWithModel: → comprehensive ad filtering
 static void hook_loadWithModel(id self, SEL _cmd, id model) {
     @try {
-        SEL contentsArraySel = NSSelectorFromString(@"contentsArray");
-        if (model && [model respondsToSelector:contentsArraySel]) {
-            NSMutableArray *contentsArray = ((id(*)(id, SEL))objc_msgSend)(model, contentsArraySel);
-            if ([contentsArray isKindOfClass:[NSMutableArray class]] && contentsArray.count > 0) {
-                NSMutableIndexSet *removeIndexes = [NSMutableIndexSet indexSet];
+        NSMutableArray *contentsArray = getContentsArray(model);
+        if (contentsArray && contentsArray.count > 0) {
+            NSMutableIndexSet *removeIndexes = [NSMutableIndexSet indexSet];
 
-                // Selectors for ad detection
-                NSArray *adChecks = @[
-                    @"hasPromotedVideoRenderer",
-                    @"hasCompactPromotedVideoRenderer",
-                    @"hasPromotedVideoInlineMutedRenderer",
+            // Try MULTIPLE section renderer accessor paths
+            // YouTube uses a protobuf "oneof" so each section can be a different type
+            static NSArray *sectionAccessors = nil;
+            static dispatch_once_t onceToken2;
+            dispatch_once(&onceToken2, ^{
+                sectionAccessors = @[
+                    @"itemSectionRenderer",
+                    @"richSectionRenderer",
+                    @"shelfRenderer",
+                    @"richGridRenderer",
+                    @"horizontalListRenderer",
+                    @"gridRenderer",
+                    @"reelShelfRenderer",
                 ];
-                SEL hasCompat = NSSelectorFromString(@"hasCompatibilityOptions");
-                SEL compatOpts = NSSelectorFromString(@"compatibilityOptions");
-                SEL hasAdLog = NSSelectorFromString(@"hasAdLoggingData");
-                SEL elemRendererSel = NSSelectorFromString(@"elementRenderer");
-                SEL elemDataSel = NSSelectorFromString(@"elementData");
+            });
 
-                // Ad type strings for element description matching
-                static NSArray *adDescTypes = nil;
-                static dispatch_once_t onceToken;
-                dispatch_once(&onceToken, ^{
-                    adDescTypes = @[@"brand_promo", @"product_carousel", @"product_engagement_panel",
-                                    @"product_item", @"text_search_ad", @"text_image_button_layout",
-                                    @"carousel_headered_layout", @"carousel_footered_layout",
-                                    @"square_image_layout", @"landscape_image_wide_button_layout",
-                                    @"feed_ad_metadata"];
-                });
+            // Ad description types for element matching
+            static NSArray *adDescTypes = nil;
+            static dispatch_once_t onceToken3;
+            dispatch_once(&onceToken3, ^{
+                adDescTypes = @[@"brand_promo", @"product_carousel", @"product_engagement_panel",
+                                @"product_item", @"text_search_ad", @"text_image_button_layout",
+                                @"carousel_headered_layout", @"carousel_footered_layout",
+                                @"square_image_layout", @"landscape_image_wide_button_layout",
+                                @"feed_ad_metadata", @"statement_banner"];
+            });
 
-                [contentsArray enumerateObjectsUsingBlock:^(id renderers, NSUInteger idx, BOOL *stop) {
-                    @try {
-                        SEL itemSec = NSSelectorFromString(@"itemSectionRenderer");
-                        if (![renderers respondsToSelector:itemSec]) return;
-                        id sectionRenderer = ((id(*)(id, SEL))objc_msgSend)(renderers, itemSec);
-                        if (!sectionRenderer) return;
+            [contentsArray enumerateObjectsUsingBlock:^(id renderers, NSUInteger idx, BOOL *stop) {
+                @try {
+                    // Check ad indicators directly on the section wrapper
+                    if (isAdRelated(renderers)) {
+                        [removeIndexes addIndex:idx];
+                        return;
+                    }
 
-                        SEL contentsSel = NSSelectorFromString(@"contentsArray");
-                        if (![sectionRenderer respondsToSelector:contentsSel]) return;
-                        NSMutableArray *contents = ((id(*)(id, SEL))objc_msgSend)(sectionRenderer, contentsSel);
-                        if (!contents || contents.count == 0) return;
+                    // Try each section renderer accessor
+                    for (NSString *accessorName in sectionAccessors) {
+                        SEL accessor = NSSelectorFromString(accessorName);
+                        if (![renderers respondsToSelector:accessor]) continue;
+                        id sectionRenderer = ((id(*)(id, SEL))objc_msgSend)(renderers, accessor);
+                        if (!sectionRenderer) continue;
 
-                        // PASS 1: Check if entire section should be removed
-                        // (any item has promoted video renderer)
-                        for (id item in contents) {
-                            for (NSString *check in adChecks) {
-                                SEL sel = NSSelectorFromString(check);
-                                if ([item respondsToSelector:sel] &&
-                                    ((BOOL(*)(id, SEL))objc_msgSend)(item, sel)) {
-                                    [removeIndexes addIndex:idx];
-                                    return;
+                        // Check ad indicators on the section renderer itself
+                        if (isAdRelated(sectionRenderer)) {
+                            [removeIndexes addIndex:idx];
+                            return;
+                        }
+
+                        // Get items inside this section
+                        NSMutableArray *contents = getContentsArray(sectionRenderer);
+                        if (!contents || contents.count == 0) continue;
+
+                        // Check each item for ad indicators
+                        BOOL sectionIsAd = NO;
+                        NSMutableIndexSet *itemRemoveIndexes = [NSMutableIndexSet indexSet];
+
+                        for (NSUInteger itemIdx = 0; itemIdx < contents.count; itemIdx++) {
+                            id item = contents[itemIdx];
+
+                            // Direct ad check on item
+                            if (isAdRelated(item)) {
+                                [itemRemoveIndexes addIndex:itemIdx];
+                                continue;
+                            }
+
+                            // Check element renderer description
+                            SEL elemSel = NSSelectorFromString(@"elementRenderer");
+                            if ([item respondsToSelector:elemSel]) {
+                                id elem = ((id(*)(id, SEL))objc_msgSend)(item, elemSel);
+                                if (elem) {
+                                    NSString *desc = [elem description];
+                                    if (desc && [adDescTypes containsObject:desc]) {
+                                        [itemRemoveIndexes addIndex:itemIdx];
+                                        continue;
+                                    }
                                 }
                             }
-                        }
 
-                        // PASS 2: Remove individual ad items from within the section
-                        // This catches sponsored items that aren't "promoted videos"
-                        if ([contents isKindOfClass:[NSMutableArray class]]) {
-                            NSMutableIndexSet *itemRemoveIndexes = [NSMutableIndexSet indexSet];
-                            [contents enumerateObjectsUsingBlock:^(id item, NSUInteger itemIdx, BOOL *itemStop) {
-                                @try {
-                                    // Check via elementRenderer accessor if available
-                                    id elemRenderer = nil;
-                                    if ([item respondsToSelector:elemRendererSel]) {
-                                        elemRenderer = ((id(*)(id, SEL))objc_msgSend)(item, elemRendererSel);
+                            // Also check first-level sub-items (for nested renderers)
+                            NSMutableArray *subContents = getContentsArray(item);
+                            if (subContents) {
+                                for (id subItem in subContents) {
+                                    if (isAdRelated(subItem)) {
+                                        sectionIsAd = YES;
+                                        break;
                                     }
-
-                                    // Check ad logging data on the element renderer
-                                    id checkTarget = elemRenderer ?: item;
-                                    if ([checkTarget respondsToSelector:hasCompat] &&
-                                        ((BOOL(*)(id, SEL))objc_msgSend)(checkTarget, hasCompat)) {
-                                        id opts = ((id(*)(id, SEL))objc_msgSend)(checkTarget, compatOpts);
-                                        if (opts && [opts respondsToSelector:hasAdLog] &&
-                                            ((BOOL(*)(id, SEL))objc_msgSend)(opts, hasAdLog)) {
-                                            [itemRemoveIndexes addIndex:itemIdx];
-                                            return;
-                                        }
-                                    }
-
-                                    // Check element renderer description for ad types
-                                    if (elemRenderer) {
-                                        NSString *desc = [elemRenderer description];
-                                        if (desc && [adDescTypes containsObject:desc]) {
-                                            [itemRemoveIndexes addIndex:itemIdx];
-                                            return;
-                                        }
-                                    }
-                                } @catch (NSException *e) {}
-                            }];
-                            if (itemRemoveIndexes.count > 0) {
-                                [contents removeObjectsAtIndexes:itemRemoveIndexes];
+                                }
+                                if (sectionIsAd) break;
                             }
                         }
-                    } @catch (NSException *e) {}
-                }];
-                if (removeIndexes.count > 0) {
-                    [contentsArray removeObjectsAtIndexes:removeIndexes];
-                }
+
+                        if (sectionIsAd) {
+                            [removeIndexes addIndex:idx];
+                            return;
+                        }
+
+                        // Remove individual ad items
+                        if (itemRemoveIndexes.count > 0) {
+                            [contents removeObjectsAtIndexes:itemRemoveIndexes];
+                        }
+
+                        // If section is now empty after removing ads, remove it
+                        if (contents.count == 0) {
+                            [removeIndexes addIndex:idx];
+                            return;
+                        }
+                    }
+                } @catch (NSException *e) {}
+            }];
+
+            if (removeIndexes.count > 0) {
+                [contentsArray removeObjectsAtIndexes:removeIndexes];
             }
         }
     } @catch (NSException *e) {}
