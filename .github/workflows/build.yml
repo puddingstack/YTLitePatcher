@@ -80,6 +80,32 @@ jobs:
           deb_url="https://github.com/dayanch96/YTLite/releases/download/v${{ inputs.tweak_version }}/com.dvntm.ytlite_${{ inputs.tweak_version }}_iphoneos-arm.deb"
           wget "$deb_url" --no-verbose -O ytplus.deb
 
+      # ── Static patch: make _dvnCheck/_dvnLocked bypass Patreon gate ──
+      - name: Install dpkg and LIEF
+        run: |
+          brew install dpkg
+          pip3 install --break-system-packages lief
+
+      - name: Patch YTLite.dylib in deb
+        run: |
+          echo "=== Extracting deb ==="
+          mkdir -p deb_rebuild
+          dpkg-deb -R ytplus.deb deb_rebuild/
+
+          DYLIB="deb_rebuild/Library/MobileSubstrate/DynamicLibraries/YTLite.dylib"
+          if [ ! -f "$DYLIB" ]; then
+            echo "::error::YTLite.dylib not found in deb"
+            exit 1
+          fi
+
+          echo "=== Patching dylib ==="
+          python3 patch_dylib.py "$DYLIB"
+
+          echo "=== Rebuilding deb ==="
+          dpkg-deb -b deb_rebuild ytplus_patched.deb
+          mv ytplus_patched.deb ytplus.deb
+          echo "Done — patched deb ready"
+
       # ── Download and validate YouTube IPA ──
       - name: Download YouTube IPA
         run: |
