@@ -103,7 +103,7 @@ def patch_dylib(dylib_path):
             if seg.name != "__DATA":
                 continue
             for sec in seg.sections:
-                if sec.sectname != "__data":
+                if sec.name != "__data":
                     continue
 
                 # The variable is at offset 0x5D81 from __DATA.__data start
