@@ -45,8 +45,6 @@ static IMP hookClassMethod(Class cls, SEL sel, IMP newImp) {
 // Stored originals
 // ============================================================
 static IMP orig_loadWithModel = NULL;
-static IMP orig_elementData = NULL;
-static IMP orig_cellForItem = NULL;
 
 // ============================================================
 // Ad blocking — these hook YouTube classes BEFORE YTLite loads
@@ -67,7 +65,7 @@ static void hook_decorateContext(id self, SEL _cmd, id ctx) {
     // Don't decorate with ad context
 }
 
-// YTSectionListViewController -loadWithModel: → filter promoted sections
+// YTSectionListViewController -loadWithModel: → filter promoted sections AND individual ad items
 static void hook_loadWithModel(id self, SEL _cmd, id model) {
     @try {
         SEL contentsArraySel = NSSelectorFromString(@"contentsArray");
@@ -76,7 +74,7 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
             if ([contentsArray isKindOfClass:[NSMutableArray class]] && contentsArray.count > 0) {
                 NSMutableIndexSet *removeIndexes = [NSMutableIndexSet indexSet];
 
-                // Ad renderer selectors to check
+                // Selectors for ad detection
                 NSArray *adChecks = @[
                     @"hasPromotedVideoRenderer",
                     @"hasCompactPromotedVideoRenderer",
@@ -85,6 +83,19 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
                 SEL hasCompat = NSSelectorFromString(@"hasCompatibilityOptions");
                 SEL compatOpts = NSSelectorFromString(@"compatibilityOptions");
                 SEL hasAdLog = NSSelectorFromString(@"hasAdLoggingData");
+                SEL elemRendererSel = NSSelectorFromString(@"elementRenderer");
+                SEL elemDataSel = NSSelectorFromString(@"elementData");
+
+                // Ad type strings for element description matching
+                static NSArray *adDescTypes = nil;
+                static dispatch_once_t onceToken;
+                dispatch_once(&onceToken, ^{
+                    adDescTypes = @[@"brand_promo", @"product_carousel", @"product_engagement_panel",
+                                    @"product_item", @"text_search_ad", @"text_image_button_layout",
+                                    @"carousel_headered_layout", @"carousel_footered_layout",
+                                    @"square_image_layout", @"landscape_image_wide_button_layout",
+                                    @"feed_ad_metadata"];
+                });
 
                 [contentsArray enumerateObjectsUsingBlock:^(id renderers, NSUInteger idx, BOOL *stop) {
                     @try {
@@ -95,12 +106,12 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
 
                         SEL contentsSel = NSSelectorFromString(@"contentsArray");
                         if (![sectionRenderer respondsToSelector:contentsSel]) return;
-                        NSArray *contents = ((id(*)(id, SEL))objc_msgSend)(sectionRenderer, contentsSel);
+                        NSMutableArray *contents = ((id(*)(id, SEL))objc_msgSend)(sectionRenderer, contentsSel);
                         if (!contents || contents.count == 0) return;
 
-                        // Check ALL items in the section, not just firstObject
+                        // PASS 1: Check if entire section should be removed
+                        // (any item has promoted video renderer)
                         for (id item in contents) {
-                            // Check promoted/ad renderer types
                             for (NSString *check in adChecks) {
                                 SEL sel = NSSelectorFromString(check);
                                 if ([item respondsToSelector:sel] &&
@@ -109,16 +120,44 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
                                     return;
                                 }
                             }
+                        }
 
-                            // Check ad logging data on each item
-                            if ([item respondsToSelector:hasCompat] &&
-                                ((BOOL(*)(id, SEL))objc_msgSend)(item, hasCompat)) {
-                                id opts = ((id(*)(id, SEL))objc_msgSend)(item, compatOpts);
-                                if (opts && [opts respondsToSelector:hasAdLog] &&
-                                    ((BOOL(*)(id, SEL))objc_msgSend)(opts, hasAdLog)) {
-                                    [removeIndexes addIndex:idx];
-                                    return;
-                                }
+                        // PASS 2: Remove individual ad items from within the section
+                        // This catches sponsored items that aren't "promoted videos"
+                        if ([contents isKindOfClass:[NSMutableArray class]]) {
+                            NSMutableIndexSet *itemRemoveIndexes = [NSMutableIndexSet indexSet];
+                            [contents enumerateObjectsUsingBlock:^(id item, NSUInteger itemIdx, BOOL *itemStop) {
+                                @try {
+                                    // Check via elementRenderer accessor if available
+                                    id elemRenderer = nil;
+                                    if ([item respondsToSelector:elemRendererSel]) {
+                                        elemRenderer = ((id(*)(id, SEL))objc_msgSend)(item, elemRendererSel);
+                                    }
+
+                                    // Check ad logging data on the element renderer
+                                    id checkTarget = elemRenderer ?: item;
+                                    if ([checkTarget respondsToSelector:hasCompat] &&
+                                        ((BOOL(*)(id, SEL))objc_msgSend)(checkTarget, hasCompat)) {
+                                        id opts = ((id(*)(id, SEL))objc_msgSend)(checkTarget, compatOpts);
+                                        if (opts && [opts respondsToSelector:hasAdLog] &&
+                                            ((BOOL(*)(id, SEL))objc_msgSend)(opts, hasAdLog)) {
+                                            [itemRemoveIndexes addIndex:itemIdx];
+                                            return;
+                                        }
+                                    }
+
+                                    // Check element renderer description for ad types
+                                    if (elemRenderer) {
+                                        NSString *desc = [elemRenderer description];
+                                        if (desc && [adDescTypes containsObject:desc]) {
+                                            [itemRemoveIndexes addIndex:itemIdx];
+                                            return;
+                                        }
+                                    }
+                                } @catch (NSException *e) {}
+                            }];
+                            if (itemRemoveIndexes.count > 0) {
+                                [contents removeObjectsAtIndexes:itemRemoveIndexes];
                             }
                         }
                     } @catch (NSException *e) {}
@@ -133,49 +172,6 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
     if (orig_loadWithModel) {
         ((void(*)(id, SEL, id))orig_loadWithModel)(self, _cmd, model);
     }
-}
-
-// YTIElementRenderer -elementData → filter individual sponsored items
-// This catches sponsored items that loadWithModel misses (items within sections).
-// Returns nil for ad items (YouTube skips nil elements entirely).
-static NSData *hook_elementData(id self, SEL _cmd) {
-    @try {
-        // Check for ad logging data (on YTIElementRenderer itself)
-        SEL hasCompat = NSSelectorFromString(@"hasCompatibilityOptions");
-        SEL compatOpts = NSSelectorFromString(@"compatibilityOptions");
-        SEL hasAdLog = NSSelectorFromString(@"hasAdLoggingData");
-
-        if ([self respondsToSelector:hasCompat] &&
-            ((BOOL(*)(id, SEL))objc_msgSend)(self, hasCompat)) {
-            id opts = ((id(*)(id, SEL))objc_msgSend)(self, compatOpts);
-            if (opts && [opts respondsToSelector:hasAdLog] &&
-                ((BOOL(*)(id, SEL))objc_msgSend)(opts, hasAdLog)) {
-                return nil;
-            }
-        }
-
-        // Check description for known ad types (EXACT match via containsObject)
-        NSString *desc = [self description];
-        if (desc) {
-            static NSArray *adTypes = nil;
-            static dispatch_once_t onceToken;
-            dispatch_once(&onceToken, ^{
-                adTypes = @[@"brand_promo", @"product_carousel", @"product_engagement_panel",
-                            @"product_item", @"text_search_ad", @"text_image_button_layout",
-                            @"carousel_headered_layout", @"carousel_footered_layout",
-                            @"square_image_layout", @"landscape_image_wide_button_layout",
-                            @"feed_ad_metadata"];
-            });
-            if ([adTypes containsObject:desc]) {
-                return nil;
-            }
-        }
-    } @catch (NSException *e) {}
-
-    if (orig_elementData) {
-        return ((NSData *(*)(id, SEL))orig_elementData)(self, _cmd);
-    }
-    return nil;
 }
 
 // Empty ad slot arrays
@@ -289,10 +285,6 @@ static void hookYouTubeClasses(void) {
         Method m = class_getInstanceMethod(cls, sel);
         if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s, id e){}));
     }
-
-    // Element-level ad filtering (catches individual sponsored items within sections)
-    cls = objc_getClass("YTIElementRenderer");
-    if (cls) orig_elementData = hookMethod(cls, @selector(elementData), (IMP)hook_elementData);
 
     // Empty ad slot arrays on player response
     cls = objc_getClass("YTIPlayerResponse");
