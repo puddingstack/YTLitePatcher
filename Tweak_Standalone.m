@@ -257,6 +257,15 @@ static id hook_emptyArray(id self, SEL _cmd) {
 }
 
 // ============================================================
+// Scorched earth: no-op promo/ad setter methods
+// Prevents ad data from being stored so it can't render
+// ============================================================
+static void hook_noop_setter(id self, SEL _cmd, id arg) {}
+static void hook_noop_setBool(id self, SEL _cmd, BOOL arg) {}
+static id hook_return_nil(id self, SEL _cmd) { return nil; }
+static BOOL hook_return_no(id self, SEL _cmd) { return NO; }
+
+// ============================================================
 // Background playback
 // ============================================================
 static BOOL hook_isPlayableInBackground(id self, SEL _cmd) { return YES; }
@@ -368,6 +377,69 @@ static void hookYouTubeClasses(void) {
     if (cls) {
         hookMethod(cls, NSSelectorFromString(@"adSlotsArray"), (IMP)hook_emptyArray);
         hookMethod(cls, NSSelectorFromString(@"playerAdsArray"), (IMP)hook_emptyArray);
+    }
+
+    // ══════════════════════════════════════════════════════
+    // SCORCHED EARTH: No-op all promo/ad setter methods
+    // These selectors were found in the YTLite binary.
+    // By no-op'ing the setters, the promo data is never stored,
+    // so it can never be rendered — regardless of section type,
+    // pagination, or renderer path.
+    // ══════════════════════════════════════════════════════
+
+    // Promo command/renderer setters — iterate ALL loaded ObjC classes
+    // because we don't know which class owns these methods
+    SEL promoSetters[] = {
+        NSSelectorFromString(@"setCommandWrapperPromoRenderer:"),
+        NSSelectorFromString(@"setHasCommandWrapperPromoRenderer:"),
+        NSSelectorFromString(@"setHasPromoCommand:"),
+        NSSelectorFromString(@"setPromoCommand:"),
+        NSSelectorFromString(@"setPromoType:"),
+        NSSelectorFromString(@"setHasPromoType:"),
+        NSSelectorFromString(@"setPaidContentWithPlayerData:"),
+    };
+    int promoSetterCount = sizeof(promoSetters)/sizeof(promoSetters[0]);
+
+    // Get ALL classes in the runtime and hook promo setters wherever they exist
+    unsigned int classCount = 0;
+    Class *allClasses = objc_copyClassList(&classCount);
+    if (allClasses) {
+        for (unsigned int i = 0; i < classCount; i++) {
+            Class c = allClasses[i];
+            // Only check YouTube/Google protobuf classes (YTI prefix)
+            const char *cname = class_getName(c);
+            if (!cname || strncmp(cname, "YTI", 3) != 0) continue;
+
+            for (int j = 0; j < promoSetterCount; j++) {
+                Method m = class_getInstanceMethod(c, promoSetters[j]);
+                if (m) {
+                    // Check if it's a BOOL setter or object setter
+                    const char *selName = sel_getName(promoSetters[j]);
+                    if (strstr(selName, "setHas") == selName) {
+                        // BOOL setter
+                        method_setImplementation(m, (IMP)hook_noop_setBool);
+                    } else {
+                        // Object setter
+                        method_setImplementation(m, (IMP)hook_noop_setter);
+                    }
+                }
+            }
+        }
+        free(allClasses);
+    }
+
+    // Also hook createAdsPlaybackCoordinator to return nil
+    unsigned int classCount2 = 0;
+    Class *allClasses2 = objc_copyClassList(&classCount2);
+    if (allClasses2) {
+        SEL createAdsSel = NSSelectorFromString(@"createAdsPlaybackCoordinator");
+        for (unsigned int i = 0; i < classCount2; i++) {
+            Method m = class_getInstanceMethod(allClasses2[i], createAdsSel);
+            if (m) {
+                method_setImplementation(m, (IMP)hook_return_nil);
+            }
+        }
+        free(allClasses2);
     }
 }
 
