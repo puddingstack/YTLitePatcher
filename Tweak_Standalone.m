@@ -124,10 +124,19 @@ static NSMutableArray *getContentsArray(id renderer) {
 }
 
 // YTSectionListViewController -loadWithModel: → comprehensive ad filtering
+static int g_loadCount = 0;
 static void hook_loadWithModel(id self, SEL _cmd, id model) {
+    g_loadCount++;
+    BOOL shouldLog = (g_loadCount <= 3); // Log first 3 calls only
+
     @try {
         NSMutableArray *contentsArray = getContentsArray(model);
         if (contentsArray && contentsArray.count > 0) {
+            if (shouldLog) {
+                NSLog(@"[YTLPatcher] loadWithModel #%d: %lu sections, model=%@",
+                      g_loadCount, (unsigned long)contentsArray.count,
+                      NSStringFromClass(object_getClass(model)));
+            }
             NSMutableIndexSet *removeIndexes = [NSMutableIndexSet indexSet];
 
             // Try MULTIPLE section renderer accessor paths
@@ -159,8 +168,21 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
 
             [contentsArray enumerateObjectsUsingBlock:^(id renderers, NSUInteger idx, BOOL *stop) {
                 @try {
+                    if (shouldLog && idx < 20) {
+                        NSString *cls = NSStringFromClass(object_getClass(renderers));
+                        // Log which section accessors this responds to
+                        NSMutableArray *responds = [NSMutableArray array];
+                        for (NSString *acc in sectionAccessors) {
+                            if ([renderers respondsToSelector:NSSelectorFromString(acc)])
+                                [responds addObject:acc];
+                        }
+                        NSLog(@"[YTLPatcher] Section #%lu: class=%@ accessors=[%@]",
+                              (unsigned long)idx, cls, [responds componentsJoinedByString:@","]);
+                    }
+
                     // Check ad indicators directly on the section wrapper
                     if (isAdRelated(renderers)) {
+                        if (shouldLog) NSLog(@"[YTLPatcher]   -> REMOVED (isAdRelated on wrapper)");
                         [removeIndexes addIndex:idx];
                         return;
                     }
@@ -172,8 +194,13 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
                         id sectionRenderer = ((id(*)(id, SEL))objc_msgSend)(renderers, accessor);
                         if (!sectionRenderer) continue;
 
+                        if (shouldLog && idx < 10) {
+                            NSLog(@"[YTLPatcher]   Found via %@", accessorName);
+                        }
+
                         // Check ad indicators on the section renderer itself
                         if (isAdRelated(sectionRenderer)) {
+                            if (shouldLog) NSLog(@"[YTLPatcher]   -> REMOVED (isAdRelated on renderer)");
                             [removeIndexes addIndex:idx];
                             return;
                         }
@@ -181,6 +208,26 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
                         // Get items inside this section
                         NSMutableArray *contents = getContentsArray(sectionRenderer);
                         if (!contents || contents.count == 0) continue;
+
+                        if (shouldLog && idx < 10) {
+                            NSLog(@"[YTLPatcher]   Items: %lu", (unsigned long)contents.count);
+                            for (NSUInteger logIdx = 0; logIdx < MIN(5, contents.count); logIdx++) {
+                                id logItem = contents[logIdx];
+                                NSString *itemCls = NSStringFromClass(object_getClass(logItem));
+                                BOOL hasElem = [logItem respondsToSelector:NSSelectorFromString(@"elementRenderer")];
+                                BOOL adRelated = isAdRelated(logItem);
+                                NSLog(@"[YTLPatcher]     Item#%lu: %@ hasElem=%d adRelated=%d",
+                                      (unsigned long)logIdx, itemCls, hasElem, adRelated);
+                                if (hasElem) {
+                                    id elem = ((id(*)(id,SEL))objc_msgSend)(logItem, NSSelectorFromString(@"elementRenderer"));
+                                    if (elem) {
+                                        NSLog(@"[YTLPatcher]       elemRenderer class=%@ desc=%@",
+                                              NSStringFromClass(object_getClass(elem)),
+                                              [[elem description] substringToIndex:MIN(100, [[elem description] length])]);
+                                    }
+                                }
+                            }
+                        }
 
                         // Check each item for ad indicators
                         BOOL sectionIsAd = NO;
