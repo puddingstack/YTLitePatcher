@@ -113,7 +113,7 @@ def patch_dylib(dylib_path):
                     break
 
                 file_offset = sec.offset + var_offset_in_section
-                print(f"  Lock variable: section={seg.name}.{sec.sectname} file_offset=0x{file_offset:x}")
+                print(f"  Lock variable: section={seg.name}.{sec.name} file_offset=0x{file_offset:x}")
 
                 with open(dylib_path, 'rb') as f:
                     f.seek(file_offset)
