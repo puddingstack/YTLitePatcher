@@ -73,6 +73,17 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
             NSMutableArray *contentsArray = ((id(*)(id, SEL))objc_msgSend)(model, contentsArraySel);
             if ([contentsArray isKindOfClass:[NSMutableArray class]] && contentsArray.count > 0) {
                 NSMutableIndexSet *removeIndexes = [NSMutableIndexSet indexSet];
+
+                // Ad renderer selectors to check
+                NSArray *adChecks = @[
+                    @"hasPromotedVideoRenderer",
+                    @"hasCompactPromotedVideoRenderer",
+                    @"hasPromotedVideoInlineMutedRenderer",
+                ];
+                SEL hasCompat = NSSelectorFromString(@"hasCompatibilityOptions");
+                SEL compatOpts = NSSelectorFromString(@"compatibilityOptions");
+                SEL hasAdLog = NSSelectorFromString(@"hasAdLoggingData");
+
                 [contentsArray enumerateObjectsUsingBlock:^(id renderers, NSUInteger idx, BOOL *stop) {
                     @try {
                         SEL itemSec = NSSelectorFromString(@"itemSectionRenderer");
@@ -83,35 +94,29 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
                         SEL contentsSel = NSSelectorFromString(@"contentsArray");
                         if (![sectionRenderer respondsToSelector:contentsSel]) return;
                         NSArray *contents = ((id(*)(id, SEL))objc_msgSend)(sectionRenderer, contentsSel);
-                        id firstObject = [contents firstObject];
-                        if (!firstObject) return;
+                        if (!contents || contents.count == 0) return;
 
-                        // Check all known promoted/ad renderer types
-                        NSArray *adChecks = @[
-                            @"hasPromotedVideoRenderer",
-                            @"hasCompactPromotedVideoRenderer",
-                            @"hasPromotedVideoInlineMutedRenderer",
-                        ];
-                        for (NSString *check in adChecks) {
-                            SEL sel = NSSelectorFromString(check);
-                            if ([firstObject respondsToSelector:sel] &&
-                                ((BOOL(*)(id, SEL))objc_msgSend)(firstObject, sel)) {
-                                [removeIndexes addIndex:idx];
-                                return;
+                        // Check ALL items in the section, not just firstObject
+                        for (id item in contents) {
+                            // Check promoted/ad renderer types
+                            for (NSString *check in adChecks) {
+                                SEL sel = NSSelectorFromString(check);
+                                if ([item respondsToSelector:sel] &&
+                                    ((BOOL(*)(id, SEL))objc_msgSend)(item, sel)) {
+                                    [removeIndexes addIndex:idx];
+                                    return;
+                                }
                             }
-                        }
 
-                        // Also check if the section has ad logging data
-                        SEL hasCompat = NSSelectorFromString(@"hasCompatibilityOptions");
-                        SEL compatOpts = NSSelectorFromString(@"compatibilityOptions");
-                        SEL hasAdLog = NSSelectorFromString(@"hasAdLoggingData");
-                        if ([firstObject respondsToSelector:hasCompat] &&
-                            ((BOOL(*)(id, SEL))objc_msgSend)(firstObject, hasCompat)) {
-                            id opts = ((id(*)(id, SEL))objc_msgSend)(firstObject, compatOpts);
-                            if (opts && [opts respondsToSelector:hasAdLog] &&
-                                ((BOOL(*)(id, SEL))objc_msgSend)(opts, hasAdLog)) {
-                                [removeIndexes addIndex:idx];
-                                return;
+                            // Check ad logging data on each item
+                            if ([item respondsToSelector:hasCompat] &&
+                                ((BOOL(*)(id, SEL))objc_msgSend)(item, hasCompat)) {
+                                id opts = ((id(*)(id, SEL))objc_msgSend)(item, compatOpts);
+                                if (opts && [opts respondsToSelector:hasAdLog] &&
+                                    ((BOOL(*)(id, SEL))objc_msgSend)(opts, hasAdLog)) {
+                                    [removeIndexes addIndex:idx];
+                                    return;
+                                }
                             }
                         }
                     } @catch (NSException *e) {}
