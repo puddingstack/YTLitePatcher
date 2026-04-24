@@ -1,16 +1,21 @@
 /*
- * YTLitePatcher v8 — Hook BEFORE YTLite
+ * YTLitePatcher v9 — DYLD_INTERPOSE for C function gate bypass
  *
- * KEY INSIGHT: We hook YouTube classes in our constructor, BEFORE
- * YTLite.dylib loads. When YTLite's MSHookMessageEx runs later, it
- * saves OUR implementation as "original". When YTLite's _dvnCheck
- * gate fails and it calls %orig, it calls OUR hook — which blocks ads.
+ * KEY INSIGHT: YTLite's own ad blocking code works perfectly —
+ * the toggle is ON in settings. But every feature hook checks
+ * _dvnCheck() or _dvnLocked() (C functions) before executing.
+ * These are EXPORTED symbols from YTLite.dylib.
  *
- * Changes from v7:
- * - Hooks installed in constructor (IMMEDIATELY, not deferred)
- * - Removed elementData hook (caused blank sections)
- * - DVN/settings hooks still deferred (need YTLite classes to exist)
- * - No timing dependency for ad blocking
+ * DYLD_INTERPOSE replaces function pointers at the dyld level
+ * BEFORE any code runs. It works on non-jailbroken iOS because
+ * it modifies __DATA (writable), not __TEXT (read-only).
+ *
+ * With _dvnCheck→0 and _dvnLocked→0, YTLite's own hooks execute
+ * their feature code for ALL features — ad blocking, background
+ * playback, UI customization — everything unlocked.
+ *
+ * We keep our direct YouTube hooks as backup, plus the DVN
+ * settings UI hooks.
  */
 
 #import <Foundation/Foundation.h>
@@ -19,6 +24,41 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
+#import <mach/mach.h>
+
+// ============================================================
+// DYLD_INTERPOSE: Replace _dvnCheck and _dvnLocked
+// These are EXPORTED C functions from YTLite.dylib.
+// DYLD_INTERPOSE works by putting replacement entries in
+// __DATA.__interpose, which dyld processes at load time.
+// ============================================================
+
+// Declare the original functions (from YTLite.dylib)
+extern BOOL _dvnCheck(void);
+extern BOOL _dvnLocked(void);
+
+// Our replacements — always return 0 (unlocked/features enabled)
+BOOL replacement_dvnCheck(void) {
+    return NO;
+}
+
+BOOL replacement_dvnLocked(void) {
+    return NO;
+}
+
+// DYLD_INTERPOSE macro
+#define DYLD_INTERPOSE(_replacement, _original) \
+    __attribute__((used)) static struct { \
+        const void *replacement; \
+        const void *original; \
+    } _interpose_##_original \
+    __attribute__((section("__DATA,__interpose"))) = { \
+        (const void *)(unsigned long)&_replacement, \
+        (const void *)(unsigned long)&_original \
+    };
+
+DYLD_INTERPOSE(replacement_dvnCheck, _dvnCheck)
+DYLD_INTERPOSE(replacement_dvnLocked, _dvnLocked)
 
 // ============================================================
 // Helpers
