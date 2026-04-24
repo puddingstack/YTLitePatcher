@@ -65,6 +65,81 @@ static void hook_decorateContext(id self, SEL _cmd, id ctx) {
     // Don't decorate with ad context
 }
 
+// Keywords that indicate sponsored / ad content in a label string
+static BOOL isSponsorKeyword(NSString *s) {
+    if (!s || ![s isKindOfClass:[NSString class]] || s.length == 0) return NO;
+    NSString *lower = [s lowercaseString];
+    return ([lower containsString:@"sponsored"] ||
+            [lower containsString:@"promoted"] ||
+            [lower isEqualToString:@"ad"] ||
+            [lower isEqualToString:@"ads"] ||
+            [lower hasPrefix:@"ad "] ||
+            [lower hasSuffix:@" ad"]);
+}
+
+// Extract a string out of a renderer-like object by trying common selectors
+static NSString *extractLabelText(id obj) {
+    if (!obj) return nil;
+    static NSArray *textSels = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        textSels = @[@"label", @"text", @"accessibilityLabel",
+                     @"simpleText", @"content", @"styleRunExtensionLabel"];
+    });
+    for (NSString *sn in textSels) {
+        SEL s = NSSelectorFromString(sn);
+        if ([obj respondsToSelector:s]) {
+            id v = ((id(*)(id, SEL))objc_msgSend)(obj, s);
+            if ([v isKindOfClass:[NSString class]]) return v;
+            // YTIFormattedString-like: has -string
+            SEL strSel = @selector(string);
+            if (v && [v respondsToSelector:strSel]) {
+                id s2 = ((id(*)(id, SEL))objc_msgSend)(v, strSel);
+                if ([s2 isKindOfClass:[NSString class]]) return s2;
+            }
+        }
+    }
+    return nil;
+}
+
+// Walk an item's badges looking for a "Sponsored"/"Ad"/"Promoted" label
+static BOOL hasSponsoredBadge(id item) {
+    if (!item) return NO;
+    static NSArray *badgeSels = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        badgeSels = @[@"badgesArray", @"badges", @"thumbnailOverlaysArray",
+                      @"metadataBadgesArray", @"ownerBadgesArray"];
+    });
+    for (NSString *sn in badgeSels) {
+        SEL s = NSSelectorFromString(sn);
+        if (![item respondsToSelector:s]) continue;
+        id arr = ((id(*)(id, SEL))objc_msgSend)(item, s);
+        if (![arr isKindOfClass:[NSArray class]]) continue;
+        for (id b in (NSArray *)arr) {
+            // badge wrapper -> metadataBadgeRenderer -> label
+            static NSArray *inner = nil;
+            static dispatch_once_t o2;
+            dispatch_once(&o2, ^{
+                inner = @[@"metadataBadgeRenderer", @"thumbnailBadgeViewModel",
+                          @"textBadgeRenderer", @"upgradedMetadataBadgeRenderer"];
+            });
+            // Check wrapper directly
+            NSString *t = extractLabelText(b);
+            if (isSponsorKeyword(t)) return YES;
+            for (NSString *in in inner) {
+                SEL is = NSSelectorFromString(in);
+                if ([b respondsToSelector:is]) {
+                    id r = ((id(*)(id, SEL))objc_msgSend)(b, is);
+                    NSString *lt = extractLabelText(r);
+                    if (isSponsorKeyword(lt)) return YES;
+                }
+            }
+        }
+    }
+    return NO;
+}
+
 // Helper: recursively check an object and its children for ad indicators
 static BOOL isAdRelated(id obj) {
     if (!obj) return NO;
@@ -108,6 +183,24 @@ static BOOL isAdRelated(id obj) {
         id elem = ((id(*)(id, SEL))objc_msgSend)(obj, elemSel);
         if (elem && isAdRelated(elem)) return YES;
     }
+
+    // Walk to the actual video renderer inside common wrappers and check badges
+    static NSArray *innerVideoSels = nil;
+    static dispatch_once_t onceV;
+    dispatch_once(&onceV, ^{
+        innerVideoSels = @[@"videoRenderer", @"videoWithContextRenderer",
+                           @"compactVideoRenderer", @"gridVideoRenderer",
+                           @"richItemRenderer", @"content"];
+    });
+    for (NSString *sn in innerVideoSels) {
+        SEL s = NSSelectorFromString(sn);
+        if ([obj respondsToSelector:s]) {
+            id inner = ((id(*)(id, SEL))objc_msgSend)(obj, s);
+            if (inner && hasSponsoredBadge(inner)) return YES;
+        }
+    }
+    // Direct badge check on the object itself
+    if (hasSponsoredBadge(obj)) return YES;
 
     return NO;
 }
@@ -257,6 +350,49 @@ static id hook_emptyArray(id self, SEL _cmd) {
 }
 
 // ============================================================
+// YTIElementRenderer -elementData : filter ads by description
+// Returns empty NSData for known ad descriptions so YouTube renders
+// nothing instead of the ad card.
+// ============================================================
+static IMP orig_elementData = NULL;
+static NSData *hook_elementData(id self, SEL _cmd) {
+    @try {
+        // hasAdLoggingData via compatibilityOptions -> drop entirely
+        SEL hasCompat = NSSelectorFromString(@"hasCompatibilityOptions");
+        SEL compatOpts = NSSelectorFromString(@"compatibilityOptions");
+        SEL hasAdLog = NSSelectorFromString(@"hasAdLoggingData");
+        if ([self respondsToSelector:hasCompat] &&
+            ((BOOL(*)(id, SEL))objc_msgSend)(self, hasCompat)) {
+            id opts = ((id(*)(id, SEL))objc_msgSend)(self, compatOpts);
+            if (opts && [opts respondsToSelector:hasAdLog] &&
+                ((BOOL(*)(id, SEL))objc_msgSend)(opts, hasAdLog)) {
+                return nil;
+            }
+        }
+        NSString *desc = [self description];
+        if (desc) {
+            NSString *lower = [desc lowercaseString];
+            // Empty NSData avoids blank-section layout issues
+            if ([lower containsString:@"brand_promo"] ||
+                [lower containsString:@"product_carousel"] ||
+                [lower containsString:@"product_engagement_panel"] ||
+                [lower containsString:@"product_item"] ||
+                [lower containsString:@"text_search_ad"] ||
+                [lower containsString:@"feed_ad_metadata"] ||
+                [lower containsString:@"statement_banner"] ||
+                [lower containsString:@"sponsor"] ||
+                [lower containsString:@"promoted_sparkles"] ||
+                [lower containsString:@"ad_slot"]) {
+                return [NSData data];
+            }
+        }
+    } @catch (NSException *e) {}
+    if (orig_elementData)
+        return ((NSData*(*)(id, SEL))orig_elementData)(self, _cmd);
+    return nil;
+}
+
+// ============================================================
 // Scorched earth: no-op promo/ad setter methods
 // Prevents ad data from being stored so it can't render
 // ============================================================
@@ -338,6 +474,10 @@ static void hookYouTubeClasses(void) {
     cls = objc_getClass("YTSectionListViewController");
     if (cls) orig_loadWithModel = hookMethod(cls, @selector(loadWithModel:), (IMP)hook_loadWithModel);
 
+    // Element-level ad filtering (brand_promo, feed_ad_metadata, sponsored, ...)
+    cls = objc_getClass("YTIElementRenderer");
+    if (cls) orig_elementData = hookMethod(cls, @selector(elementData), (IMP)hook_elementData);
+
     // Background playback
     cls = objc_getClass("YTIPlayabilityStatus");
     if (cls) hookMethod(cls, @selector(isPlayableInBackground), (IMP)hook_isPlayableInBackground);
@@ -391,6 +531,20 @@ static void hookDVNClasses(void) {
     g_dvnHooked = YES;
 
     Class cls;
+
+    // Re-install feed-ad hooks ON TOP of YTLite's. At this point YTLite
+    // has already replaced our earlier hook; we overwrite again so OUR
+    // filter runs first, then chains to YTLite's (now stored as orig).
+    cls = objc_getClass("YTSectionListViewController");
+    if (cls) {
+        IMP newOrig = hookMethod(cls, @selector(loadWithModel:), (IMP)hook_loadWithModel);
+        if (newOrig) orig_loadWithModel = newOrig;
+    }
+    cls = objc_getClass("YTIElementRenderer");
+    if (cls) {
+        IMP newOrig = hookMethod(cls, @selector(elementData), (IMP)hook_elementData);
+        if (newOrig) orig_elementData = newOrig;
+    }
 
     cls = objc_getClass("DVNCell");
     if (cls) {
