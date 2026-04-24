@@ -91,7 +91,43 @@ def patch_dylib(dylib_path):
             patched_slice += 1
 
         patched_total += patched_slice
-        print(f"  Patched {patched_slice} symbols in this slice")
+        print(f"  Patched {patched_slice} function(s) in this slice")
+
+        # ── ALSO patch the lock variable in __DATA.__data ──
+        # _dvnLocked reads from __DATA.__data + offset 0x5D81
+        # But 3 OTHER code paths also read it directly (bypassing _dvnLocked)
+        # They use: LDRB + EOR #1 + AND #1 → variable=0 means feature ACTIVE
+        # So we need variable = 0 for the direct readers
+        # (_dvnLocked is already patched to always return 0 regardless)
+        for seg in macho.segments:
+            if seg.name != "__DATA":
+                continue
+            for sec in seg.sections:
+                if sec.sectname != "__data":
+                    continue
+
+                # The variable is at offset 0x5D81 from __DATA.__data start
+                var_offset_in_section = 0x5D81
+                if var_offset_in_section + 2 > sec.size:
+                    print(f"  WARNING: lock variable offset 0x5D81 out of range")
+                    break
+
+                file_offset = sec.offset + var_offset_in_section
+                print(f"  Lock variable: section={seg.name}.{sec.sectname} file_offset=0x{file_offset:x}")
+
+                with open(dylib_path, 'rb') as f:
+                    f.seek(file_offset)
+                    original = f.read(2)
+                print(f"    original: {original.hex()}")
+
+                # Write 0x00 for both bytes (variable + adjacent flag)
+                # variable=0 → direct readers: EOR(0,1)=1 AND 1=1 → feature ACTIVE
+                with open(dylib_path, 'r+b') as f:
+                    f.seek(file_offset)
+                    f.write(b'\x00\x00')
+                print(f"    patched:  0000 (features active for direct readers)")
+                patched_total += 1
+                break
 
     print(f"\nTotal patches applied: {patched_total}")
     return patched_total > 0
