@@ -1,18 +1,22 @@
 /*
- * YTLitePatcher v6
+ * YTLitePatcher v7 — Direct Feature Implementation
  *
- * FINDINGS from LIEF binary analysis:
- * - _dvnLocked() reads a BOOL at 0x11524e1 in __DATA.__data (WRITABLE!)
- * - Current value = 1 (locked). Setting to 0 = unlocked.
- * - _dvnCheck() calls an internal function then objc_msgSend (checks auth)
- * - 4 functions READ this variable, 1 function WRITES it
- * - The variable is at offset 23937 (0x5D81) into __DATA.__data section
+ * NEW APPROACH: Instead of trying to bypass _dvnCheck (which is
+ * obfuscated and can't be hooked on non-jailbroken iOS), we
+ * RE-IMPLEMENT the features ourselves by hooking the same YouTube
+ * classes that YTLite hooks.
  *
- * Strategy:
- * 1. Find YTLite.dylib's __DATA.__data section at runtime
- * 2. Zero the lock variable (safe — __DATA is writable)
- * 3. ObjC hooks for settings UI
- * 4. Periodically re-zero in case YTLite resets it
+ * Our hooks apply AFTER YTLite's (1-second delay via dyld callback),
+ * so they OVERRIDE YTLite's gated implementations with ungated ones.
+ *
+ * Based on the open-source YTLite.x code — we implement the same
+ * hooks but without any patron check.
+ *
+ * Features implemented:
+ *   - Ad removal (isMonetized, spamSignals, decorateContext, etc.)
+ *   - Background playback
+ *   - Premium popup removal
+ *   - Settings UI cleanup (patreon section, lock icons)
  */
 
 #import <Foundation/Foundation.h>
@@ -21,46 +25,181 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
-#import <mach-o/loader.h>
 
 // ============================================================
-// ObjC helpers
+// Helpers
 // ============================================================
-static void swizzleMethod(Class cls, SEL original, IMP replacement, IMP *store) {
-    Method method = class_getInstanceMethod(cls, original);
-    if (method) {
-        *store = method_getImplementation(method);
-        method_setImplementation(method, replacement);
+static IMP hookMethod(Class cls, SEL sel, IMP newImp) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) m = class_getClassMethod(cls, sel);
+    if (!m) return NULL;
+    IMP orig = method_getImplementation(m);
+    method_setImplementation(m, newImp);
+    return orig;
+}
+
+static IMP hookClassMethod(Class cls, SEL sel, IMP newImp) {
+    // Class methods are on the metaclass
+    Class meta = object_getClass(cls);
+    Method m = class_getInstanceMethod(meta, sel);
+    if (!m) return NULL;
+    IMP orig = method_getImplementation(m);
+    method_setImplementation(m, newImp);
+    return orig;
+}
+
+// ============================================================
+// Stored original IMPs (for hooks that need %orig)
+// ============================================================
+static IMP orig_elementData = NULL;
+static IMP orig_loadWithModel = NULL;
+
+// ============================================================
+// Ad blocking hooks
+// ============================================================
+
+// YTIPlayerResponse -isMonetized → always NO
+static BOOL hook_isMonetized(id self, SEL _cmd) {
+    return NO;
+}
+
+// YTDataUtils +spamSignalsDictionary → nil
+static id hook_spamSignals(id self, SEL _cmd) {
+    return nil;
+}
+
+// YTAdsInnerTubeContextDecorator -decorateContext: → no-op
+static void hook_decorateContext(id self, SEL _cmd, id context) {
+    // Skip ad context decoration entirely
+}
+
+// YTIElementRenderer -elementData → filter ads
+static NSData *hook_elementData(id self, SEL _cmd) {
+    if (!orig_elementData) return nil;
+    
+    // Check if this element has ad logging data
+    SEL hasCompat = NSSelectorFromString(@"hasCompatibilityOptions");
+    SEL compatOpts = NSSelectorFromString(@"compatibilityOptions");
+    SEL hasAdLog = NSSelectorFromString(@"hasAdLoggingData");
+    
+    if ([self respondsToSelector:hasCompat] &&
+        [self respondsToSelector:compatOpts] &&
+        ((BOOL(*)(id, SEL))objc_msgSend)(self, hasCompat)) {
+        id opts = ((id(*)(id, SEL))objc_msgSend)(self, compatOpts);
+        if (opts && [opts respondsToSelector:hasAdLog] &&
+            ((BOOL(*)(id, SEL))objc_msgSend)(opts, hasAdLog)) {
+            return nil;
+        }
+    }
+    
+    // Check description for ad types
+    NSString *desc = [self description];
+    NSArray *adTypes = @[@"brand_promo", @"product_carousel", @"product_engagement_panel",
+                         @"product_item", @"text_search_ad", @"text_image_button_layout",
+                         @"carousel_headered_layout", @"carousel_footered_layout",
+                         @"square_image_layout", @"landscape_image_wide_button_layout",
+                         @"feed_ad_metadata"];
+    
+    for (NSString *ad in adTypes) {
+        if ([desc containsString:ad]) {
+            return [NSData data];
+        }
+    }
+    
+    return ((NSData *(*)(id, SEL))orig_elementData)(self, _cmd);
+}
+
+// YTSectionListViewController -loadWithModel: → remove promoted content
+static void hook_loadWithModel(id self, SEL _cmd, id model) {
+    // Remove promoted video renderers from section list
+    SEL contentsArraySel = NSSelectorFromString(@"contentsArray");
+    if ([model respondsToSelector:contentsArraySel]) {
+        NSMutableArray *contentsArray = ((id(*)(id, SEL))objc_msgSend)(model, contentsArraySel);
+        if ([contentsArray isKindOfClass:[NSMutableArray class]]) {
+            NSIndexSet *removeIndexes = [contentsArray indexesOfObjectsPassingTest:
+                ^BOOL(id renderers, NSUInteger idx, BOOL *stop) {
+                    SEL itemSec = NSSelectorFromString(@"itemSectionRenderer");
+                    if (![renderers respondsToSelector:itemSec]) return NO;
+                    id sectionRenderer = ((id(*)(id, SEL))objc_msgSend)(renderers, itemSec);
+                    if (!sectionRenderer) return NO;
+                    
+                    SEL contentsSel = NSSelectorFromString(@"contentsArray");
+                    if (![sectionRenderer respondsToSelector:contentsSel]) return NO;
+                    NSArray *contents = ((id(*)(id, SEL))objc_msgSend)(sectionRenderer, contentsSel);
+                    id firstObject = [contents firstObject];
+                    if (!firstObject) return NO;
+                    
+                    SEL hasPromo = NSSelectorFromString(@"hasPromotedVideoRenderer");
+                    SEL hasCompactPromo = NSSelectorFromString(@"hasCompactPromotedVideoRenderer");
+                    SEL hasInlineMuted = NSSelectorFromString(@"hasPromotedVideoInlineMutedRenderer");
+                    
+                    return ([firstObject respondsToSelector:hasPromo] && ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, hasPromo)) ||
+                           ([firstObject respondsToSelector:hasCompactPromo] && ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, hasCompactPromo)) ||
+                           ([firstObject respondsToSelector:hasInlineMuted] && ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, hasInlineMuted));
+                }];
+            [contentsArray removeObjectsAtIndexes:removeIndexes];
+        }
+    }
+    
+    if (orig_loadWithModel) {
+        ((void(*)(id, SEL, id))orig_loadWithModel)(self, _cmd, model);
     }
 }
 
-static void forceReturnYES(Class cls, SEL sel) {
-    Method m = class_getInstanceMethod(cls, sel);
-    if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s){ return YES; }));
+// ============================================================
+// Background playback hooks
+// ============================================================
+
+// YTIPlayabilityStatus -isPlayableInBackground → YES
+static BOOL hook_isPlayableInBackground(id self, SEL _cmd) {
+    return YES;
 }
 
-static void forceReturnNO(Class cls, SEL sel) {
-    Method m = class_getInstanceMethod(cls, sel);
-    if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s){ return NO; }));
+// MLVideo -playableInBackground → YES
+static BOOL hook_playableInBackground(id self, SEL _cmd) {
+    return YES;
 }
 
 // ============================================================
-// Replacements
+// Premium popup removal hooks
+// ============================================================
+
+// Various handlers -addEventHandlers → no-op
+static void hook_addEventHandlers(id self, SEL _cmd) {
+    // Block premium/promo event handlers
+}
+
+// YTPromoThrottleController -canShowThrottledPromo* → NO
+static BOOL hook_canShowThrottledPromo(id self, SEL _cmd) {
+    return NO;
+}
+
+static BOOL hook_canShowThrottledPromoWithArg(id self, SEL _cmd, id arg) {
+    return NO;
+}
+
+// YTIShowFullscreenInterstitialCommand -shouldThrottleInterstitial → YES
+static BOOL hook_shouldThrottleInterstitial(id self, SEL _cmd) {
+    return YES;
+}
+
+// ============================================================
+// Settings UI hooks (keep from v6)
 // ============================================================
 static IMP orig_DVNCell_setLocked;
-static void rep_DVNCell_setLocked(id self, SEL _cmd, BOOL locked) {
+static void hook_DVNCell_setLocked(id self, SEL _cmd, BOOL locked) {
     if (orig_DVNCell_setLocked)
         ((void(*)(id, SEL, BOOL))orig_DVNCell_setLocked)(self, _cmd, NO);
 }
 
 static IMP orig_DVNTVC_setLocked;
-static void rep_DVNTVC_setLocked(id self, SEL _cmd, BOOL locked) {
+static void hook_DVNTVC_setLocked(id self, SEL _cmd, BOOL locked) {
     if (orig_DVNTVC_setLocked)
         ((void(*)(id, SEL, BOOL))orig_DVNTVC_setLocked)(self, _cmd, NO);
 }
 
 static IMP orig_WelcomeVC_viewDidLoad;
-static void rep_WelcomeVC_viewDidLoad(id self, SEL _cmd) {
+static void hook_WelcomeVC_viewDidLoad(id self, SEL _cmd) {
     if (orig_WelcomeVC_viewDidLoad)
         ((void(*)(id, SEL))orig_WelcomeVC_viewDidLoad)(self, _cmd);
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -69,7 +208,7 @@ static void rep_WelcomeVC_viewDidLoad(id self, SEL _cmd) {
 }
 
 static IMP orig_patreonSection;
-static id rep_patreonSection(id self, SEL _cmd) {
+static id hook_patreonSection(id self, SEL _cmd) {
     id section = orig_patreonSection
         ? ((id(*)(id, SEL))orig_patreonSection)(self, _cmd) : nil;
     if (section) {
@@ -81,92 +220,110 @@ static id rep_patreonSection(id self, SEL _cmd) {
 }
 
 // ============================================================
-// __DATA variable finder — safe, only touches writable memory
-// Finds __DATA.__data section and zeros the lock variable.
-// ============================================================
-static uint8_t *g_lockVarAddr = NULL;
-
-static void findAndZeroLockVar(const struct mach_header *mh, intptr_t slide) {
-    if (!mh) return;
-
-    const struct mach_header_64 *h64 = (const struct mach_header_64 *)mh;
-    struct load_command *cmd = (struct load_command *)((uintptr_t)h64 + sizeof(struct mach_header_64));
-
-    for (uint32_t i = 0; i < h64->ncmds; i++) {
-        if (cmd->cmd == LC_SEGMENT_64) {
-            struct segment_command_64 *seg = (struct segment_command_64 *)cmd;
-            if (strcmp(seg->segname, "__DATA") == 0) {
-                struct section_64 *sections = (struct section_64 *)((uintptr_t)seg + sizeof(struct segment_command_64));
-                for (uint32_t j = 0; j < seg->nsects; j++) {
-                    if (strcmp(sections[j].sectname, "__data") == 0) {
-                        // Found __DATA.__data
-                        uintptr_t sec_addr = sections[j].addr + slide;
-                        uint64_t sec_size = sections[j].size;
-
-                        // The lock variable is at offset 0x5D81 into __DATA.__data
-                        // _dvnLocked() does: return 1 & (~variable)
-                        //   variable=1 → ~1=0 → return 0 → NOT locked (features ON)
-                        //   variable=0 → ~0=FF → return 1 → LOCKED (features OFF)
-                        // So we need to SET it to 1, not zero it!
-                        uint64_t lock_offset = 0x5D81;
-
-                        if (lock_offset + 2 <= sec_size) {
-                            g_lockVarAddr = (uint8_t *)(sec_addr + lock_offset);
-                            g_lockVarAddr[0] = 1;  // 1 = unlocked (BIC inverts)
-                            g_lockVarAddr[1] = 1;  // adjacent flag too
-                        }
-                        return;
-                    }
-                }
-            }
-        }
-        cmd = (struct load_command *)((uintptr_t)cmd + cmd->cmdsize);
-    }
-}
-
-static void reZeroLockVar(void) {
-    if (g_lockVarAddr) {
-        g_lockVarAddr[0] = 1;  // 1 = unlocked (BIC inverts the logic)
-        g_lockVarAddr[1] = 1;
-    }
-}
-
-// ============================================================
-// Hook registration — called after YTLite init completes
+// Registration
 // ============================================================
 static BOOL g_hooked = NO;
 
-static void registerAllHooks(const struct mach_header *mh, intptr_t slide) {
+static void registerAllHooks(void) {
     if (g_hooked) return;
     g_hooked = YES;
 
-    // ── LEVEL 1: Zero the lock variable in __DATA (safe, writable) ──
-    findAndZeroLockVar(mh, slide);
+    // ══════════════════════════════════════════════════════
+    // AD BLOCKING — hook YouTube classes directly
+    // These override YTLite's gated implementations
+    // ══════════════════════════════════════════════════════
 
-    // ── LEVEL 2: ObjC hooks ──
+    // YTIPlayerResponse -isMonetized
+    Class cls = objc_getClass("YTIPlayerResponse");
+    if (cls) hookMethod(cls, @selector(isMonetized), (IMP)hook_isMonetized);
 
-    // -- DVNCell: unlock all cells --
-    Class dvnCell = objc_getClass("DVNCell");
-    if (dvnCell) {
-        swizzleMethod(dvnCell, @selector(setLocked:),
-                      (IMP)rep_DVNCell_setLocked, &orig_DVNCell_setLocked);
-        forceReturnNO(dvnCell, @selector(isLocked));
-        forceReturnNO(dvnCell, @selector(locked));
+    // YTDataUtils +spamSignalsDictionary / +spamSignalsDictionaryWithoutIDFA
+    cls = objc_getClass("YTDataUtils");
+    if (cls) {
+        hookClassMethod(cls, @selector(spamSignalsDictionary), (IMP)hook_spamSignals);
+        hookClassMethod(cls, NSSelectorFromString(@"spamSignalsDictionaryWithoutIDFA"), (IMP)hook_spamSignals);
     }
 
-    // -- DVNTableViewController: unlock --
-    Class dvnTVC = objc_getClass("DVNTableViewController");
-    if (dvnTVC) {
-        Method m = class_getInstanceMethod(dvnTVC, @selector(setLocked:));
-        if (m) swizzleMethod(dvnTVC, @selector(setLocked:),
-                             (IMP)rep_DVNTVC_setLocked, &orig_DVNTVC_setLocked);
-        forceReturnNO(dvnTVC, @selector(locked));
-        forceReturnNO(dvnTVC, @selector(isLocked));
+    // YTAdsInnerTubeContextDecorator -decorateContext:
+    cls = objc_getClass("YTAdsInnerTubeContextDecorator");
+    if (cls) hookMethod(cls, @selector(decorateContext:), (IMP)hook_decorateContext);
+
+    // YTAccountScopedAdsInnerTubeContextDecorator -decorateContext:
+    cls = objc_getClass("YTAccountScopedAdsInnerTubeContextDecorator");
+    if (cls) hookMethod(cls, @selector(decorateContext:), (IMP)hook_decorateContext);
+
+    // YTIElementRenderer -elementData
+    cls = objc_getClass("YTIElementRenderer");
+    if (cls) orig_elementData = hookMethod(cls, @selector(elementData), (IMP)hook_elementData);
+
+    // YTSectionListViewController -loadWithModel:
+    cls = objc_getClass("YTSectionListViewController");
+    if (cls) orig_loadWithModel = hookMethod(cls, @selector(loadWithModel:), (IMP)hook_loadWithModel);
+
+    // ══════════════════════════════════════════════════════
+    // BACKGROUND PLAYBACK
+    // ══════════════════════════════════════════════════════
+
+    cls = objc_getClass("YTIPlayabilityStatus");
+    if (cls) hookMethod(cls, @selector(isPlayableInBackground), (IMP)hook_isPlayableInBackground);
+
+    cls = objc_getClass("MLVideo");
+    if (cls) hookMethod(cls, @selector(playableInBackground), (IMP)hook_playableInBackground);
+
+    // ══════════════════════════════════════════════════════
+    // PREMIUM POPUP REMOVAL
+    // ══════════════════════════════════════════════════════
+
+    cls = objc_getClass("YTCommerceEventGroupHandler");
+    if (cls) hookMethod(cls, @selector(addEventHandlers), (IMP)hook_addEventHandlers);
+
+    cls = objc_getClass("YTInterstitialPromoEventGroupHandler");
+    if (cls) hookMethod(cls, @selector(addEventHandlers), (IMP)hook_addEventHandlers);
+
+    cls = objc_getClass("YTPromosheetEventGroupHandler");
+    if (cls) hookMethod(cls, @selector(addEventHandlers), (IMP)hook_addEventHandlers);
+
+    cls = objc_getClass("YTPromoThrottleController");
+    if (cls) {
+        hookMethod(cls, NSSelectorFromString(@"canShowThrottledPromo"), (IMP)hook_canShowThrottledPromo);
+        hookMethod(cls, NSSelectorFromString(@"canShowThrottledPromoWithFrequencyCap:"), (IMP)hook_canShowThrottledPromoWithArg);
+        hookMethod(cls, NSSelectorFromString(@"canShowThrottledPromoWithFrequencyCaps:"), (IMP)hook_canShowThrottledPromoWithArg);
     }
 
-    // -- DVNPatreonContext: force all auth checks to YES --
-    Class patreonCtx = objc_getClass("DVNPatreonContext");
-    if (patreonCtx) {
+    cls = objc_getClass("YTIShowFullscreenInterstitialCommand");
+    if (cls) hookMethod(cls, NSSelectorFromString(@"shouldThrottleInterstitial"), (IMP)hook_shouldThrottleInterstitial);
+
+    // YTSettingsSectionItemManager -updatePremiumEarlyAccessSectionWithEntry: → no-op
+    cls = objc_getClass("YTSettingsSectionItemManager");
+    if (cls) {
+        SEL sel = NSSelectorFromString(@"updatePremiumEarlyAccessSectionWithEntry:");
+        Method m = class_getInstanceMethod(cls, sel);
+        if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s, id e){}));
+    }
+
+    // ══════════════════════════════════════════════════════
+    // SETTINGS UI — unlock cells, dismiss welcome, empty patreon
+    // ══════════════════════════════════════════════════════
+
+    cls = objc_getClass("DVNCell");
+    if (cls) {
+        orig_DVNCell_setLocked = hookMethod(cls, @selector(setLocked:), (IMP)hook_DVNCell_setLocked);
+        Method m = class_getInstanceMethod(cls, @selector(isLocked));
+        if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s){ return NO; }));
+        m = class_getInstanceMethod(cls, @selector(locked));
+        if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s){ return NO; }));
+    }
+
+    cls = objc_getClass("DVNTableViewController");
+    if (cls) {
+        Method m = class_getInstanceMethod(cls, @selector(setLocked:));
+        if (m) orig_DVNTVC_setLocked = hookMethod(cls, @selector(setLocked:), (IMP)hook_DVNTVC_setLocked);
+        m = class_getInstanceMethod(cls, @selector(locked));
+        if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s){ return NO; }));
+    }
+
+    cls = objc_getClass("DVNPatreonContext");
+    if (cls) {
         SEL authSels[] = {
             @selector(isAuthorized), @selector(isAuthenticated),
             @selector(isLoggedIn), @selector(isActive),
@@ -174,61 +331,43 @@ static void registerAllHooks(const struct mach_header *mh, intptr_t slide) {
             NSSelectorFromString(@"hasActiveSubscription"),
         };
         for (int i = 0; i < sizeof(authSels)/sizeof(authSels[0]); i++) {
-            if (authSels[i]) forceReturnYES(patreonCtx, authSels[i]);
+            if (!authSels[i]) continue;
+            Method m = class_getInstanceMethod(cls, authSels[i]);
+            if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id s){ return YES; }));
         }
     }
 
-    // -- WelcomeVC: auto-dismiss login screen --
-    Class welcomeVC = objc_getClass("WelcomeVC");
-    if (welcomeVC) {
-        swizzleMethod(welcomeVC, @selector(viewDidLoad),
-                      (IMP)rep_WelcomeVC_viewDidLoad, &orig_WelcomeVC_viewDidLoad);
-    }
+    cls = objc_getClass("WelcomeVC");
+    if (cls) orig_WelcomeVC_viewDidLoad = hookMethod(cls, @selector(viewDidLoad), (IMP)hook_WelcomeVC_viewDidLoad);
 
-    // -- YTPSettingsBuilder: empty patreon section --
-    Class settingsBuilder = objc_getClass("YTPSettingsBuilder");
-    if (settingsBuilder) {
-        Method m = class_getInstanceMethod(settingsBuilder,
-                       NSSelectorFromString(@"patreonSection"));
+    cls = objc_getClass("YTPSettingsBuilder");
+    if (cls) {
+        Method m = class_getInstanceMethod(cls, NSSelectorFromString(@"patreonSection"));
         if (m) {
             orig_patreonSection = method_getImplementation(m);
-            method_setImplementation(m, (IMP)rep_patreonSection);
-        }
-    }
-
-    // ── LEVEL 3: Periodic re-zero of lock variable ──
-    if (g_lockVarAddr) {
-        for (int i = 1; i <= 20; i++) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, i * 3 * NSEC_PER_SEC),
-                           dispatch_get_main_queue(), ^{ reZeroLockVar(); });
+            method_setImplementation(m, (IMP)hook_patreonSection);
         }
     }
 }
 
 // ============================================================
-// dyld callback — waits for YTLite.dylib specifically
+// dyld callback — waits for YTLite.dylib, then defers hooks
 // ============================================================
-static const struct mach_header *g_ytlHeader = NULL;
-static intptr_t g_ytlSlide = 0;
-
 static void dyld_image_added(const struct mach_header *mh, intptr_t slide) {
     if (g_hooked) return;
 
     Dl_info info;
     if (!dladdr(mh, &info) || !info.dli_fname) return;
 
-    // Match YTLite.dylib EXACTLY — not "YTLitePatcher.dylib"
     const char *fname = strrchr(info.dli_fname, '/');
     fname = fname ? fname + 1 : info.dli_fname;
     if (strcmp(fname, "YTLite.dylib") != 0) return;
 
-    g_ytlHeader = mh;
-    g_ytlSlide = slide;
-
-    // Defer 1 second so YTLite's constructor completes first
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+    // Defer 2 seconds — YTLite needs to finish its constructor
+    // AND register all its hooks before we override them
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        registerAllHooks(g_ytlHeader, g_ytlSlide);
+        registerAllHooks();
     });
 }
 
