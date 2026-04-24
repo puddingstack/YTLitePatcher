@@ -104,15 +104,16 @@ static void findAndZeroLockVar(const struct mach_header *mh, intptr_t slide) {
                         uint64_t sec_size = sections[j].size;
 
                         // The lock variable is at offset 0x5D81 into __DATA.__data
-                        // (address 0x11524e1, section base 0x114c760, offset = 0x5D81)
+                        // _dvnLocked() does: return 1 & (~variable)
+                        //   variable=1 → ~1=0 → return 0 → NOT locked (features ON)
+                        //   variable=0 → ~0=FF → return 1 → LOCKED (features OFF)
+                        // So we need to SET it to 1, not zero it!
                         uint64_t lock_offset = 0x5D81;
 
                         if (lock_offset + 2 <= sec_size) {
                             g_lockVarAddr = (uint8_t *)(sec_addr + lock_offset);
-                            // Zero both the variable AND the adjacent byte
-                            // (surrounding bytes showed 00 00 00 01 01 00 00 00)
-                            g_lockVarAddr[0] = 0;  // main lock flag
-                            g_lockVarAddr[1] = 0;  // adjacent flag
+                            g_lockVarAddr[0] = 1;  // 1 = unlocked (BIC inverts)
+                            g_lockVarAddr[1] = 1;  // adjacent flag too
                         }
                         return;
                     }
@@ -125,8 +126,8 @@ static void findAndZeroLockVar(const struct mach_header *mh, intptr_t slide) {
 
 static void reZeroLockVar(void) {
     if (g_lockVarAddr) {
-        g_lockVarAddr[0] = 0;
-        g_lockVarAddr[1] = 0;
+        g_lockVarAddr[0] = 1;  // 1 = unlocked (BIC inverts the logic)
+        g_lockVarAddr[1] = 1;
     }
 }
 
