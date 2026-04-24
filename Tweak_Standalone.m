@@ -45,6 +45,8 @@ static IMP hookClassMethod(Class cls, SEL sel, IMP newImp) {
 // Stored originals
 // ============================================================
 static IMP orig_loadWithModel = NULL;
+static IMP orig_elementData = NULL;
+static IMP orig_cellForItem = NULL;
 
 // ============================================================
 // Ad blocking — these hook YouTube classes BEFORE YTLite loads
@@ -131,6 +133,54 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
     if (orig_loadWithModel) {
         ((void(*)(id, SEL, id))orig_loadWithModel)(self, _cmd, model);
     }
+}
+
+// YTIElementRenderer -elementData → filter individual sponsored items
+// This catches sponsored items that loadWithModel misses (items within sections).
+// Returns nil for ad items (YouTube skips nil elements entirely).
+static NSData *hook_elementData(id self, SEL _cmd) {
+    @try {
+        // Check for ad logging data (on YTIElementRenderer itself)
+        SEL hasCompat = NSSelectorFromString(@"hasCompatibilityOptions");
+        SEL compatOpts = NSSelectorFromString(@"compatibilityOptions");
+        SEL hasAdLog = NSSelectorFromString(@"hasAdLoggingData");
+
+        if ([self respondsToSelector:hasCompat] &&
+            ((BOOL(*)(id, SEL))objc_msgSend)(self, hasCompat)) {
+            id opts = ((id(*)(id, SEL))objc_msgSend)(self, compatOpts);
+            if (opts && [opts respondsToSelector:hasAdLog] &&
+                ((BOOL(*)(id, SEL))objc_msgSend)(opts, hasAdLog)) {
+                return nil;
+            }
+        }
+
+        // Check description for known ad types (EXACT match via containsObject)
+        NSString *desc = [self description];
+        if (desc) {
+            static NSArray *adTypes = nil;
+            static dispatch_once_t onceToken;
+            dispatch_once(&onceToken, ^{
+                adTypes = @[@"brand_promo", @"product_carousel", @"product_engagement_panel",
+                            @"product_item", @"text_search_ad", @"text_image_button_layout",
+                            @"carousel_headered_layout", @"carousel_footered_layout",
+                            @"square_image_layout", @"landscape_image_wide_button_layout",
+                            @"feed_ad_metadata"];
+            });
+            if ([adTypes containsObject:desc]) {
+                return nil;
+            }
+        }
+    } @catch (NSException *e) {}
+
+    if (orig_elementData) {
+        return ((NSData *(*)(id, SEL))orig_elementData)(self, _cmd);
+    }
+    return nil;
+}
+
+// Empty ad slot arrays
+static id hook_emptyArray(id self, SEL _cmd) {
+    return @[];
 }
 
 // ============================================================
@@ -238,6 +288,17 @@ static void hookYouTubeClasses(void) {
         SEL sel = NSSelectorFromString(@"updatePremiumEarlyAccessSectionWithEntry:");
         Method m = class_getInstanceMethod(cls, sel);
         if (m) method_setImplementation(m, imp_implementationWithBlock(^(id s, id e){}));
+    }
+
+    // Element-level ad filtering (catches individual sponsored items within sections)
+    cls = objc_getClass("YTIElementRenderer");
+    if (cls) orig_elementData = hookMethod(cls, @selector(elementData), (IMP)hook_elementData);
+
+    // Empty ad slot arrays on player response
+    cls = objc_getClass("YTIPlayerResponse");
+    if (cls) {
+        hookMethod(cls, NSSelectorFromString(@"adSlotsArray"), (IMP)hook_emptyArray);
+        hookMethod(cls, NSSelectorFromString(@"playerAdsArray"), (IMP)hook_emptyArray);
     }
 }
 
