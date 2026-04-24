@@ -51,7 +51,6 @@ static IMP hookClassMethod(Class cls, SEL sel, IMP newImp) {
 // ============================================================
 // Stored original IMPs (for hooks that need %orig)
 // ============================================================
-static IMP orig_elementData = NULL;
 static IMP orig_loadWithModel = NULL;
 
 // ============================================================
@@ -73,43 +72,8 @@ static void hook_decorateContext(id self, SEL _cmd, id context) {
     // Skip ad context decoration entirely
 }
 
-// YTIElementRenderer -elementData → filter ads
-static NSData *hook_elementData(id self, SEL _cmd) {
-    if (!orig_elementData) return nil;
-    
-    // Check if this element has ad logging data
-    SEL hasCompat = NSSelectorFromString(@"hasCompatibilityOptions");
-    SEL compatOpts = NSSelectorFromString(@"compatibilityOptions");
-    SEL hasAdLog = NSSelectorFromString(@"hasAdLoggingData");
-    
-    if ([self respondsToSelector:hasCompat] &&
-        [self respondsToSelector:compatOpts] &&
-        ((BOOL(*)(id, SEL))objc_msgSend)(self, hasCompat)) {
-        id opts = ((id(*)(id, SEL))objc_msgSend)(self, compatOpts);
-        if (opts && [opts respondsToSelector:hasAdLog] &&
-            ((BOOL(*)(id, SEL))objc_msgSend)(opts, hasAdLog)) {
-            return nil;
-        }
-    }
-    
-    // Use description as identifier — EXACT match only (containsObject, not containsString)
-    NSString *desc = [self description];
-    NSArray *adTypes = @[@"brand_promo", @"product_carousel", @"product_engagement_panel",
-                         @"product_item", @"text_search_ad", @"text_image_button_layout",
-                         @"carousel_headered_layout", @"carousel_footered_layout",
-                         @"square_image_layout", @"landscape_image_wide_button_layout",
-                         @"feed_ad_metadata"];
-    
-    if ([adTypes containsObject:desc]) {
-        return [NSData data];
-    }
-    
-    return ((NSData *(*)(id, SEL))orig_elementData)(self, _cmd);
-}
-
-// YTSectionListViewController -loadWithModel: → remove promoted content
+// YTSectionListViewController -loadWithModel: → remove promoted/sponsored content
 static void hook_loadWithModel(id self, SEL _cmd, id model) {
-    // Remove promoted video renderers from section list BEFORE calling orig
     @try {
         SEL contentsArraySel = NSSelectorFromString(@"contentsArray");
         if (model && [model respondsToSelector:contentsArraySel]) {
@@ -117,6 +81,7 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
             if ([contentsArray isKindOfClass:[NSMutableArray class]] && contentsArray.count > 0) {
                 NSMutableIndexSet *removeIndexes = [NSMutableIndexSet indexSet];
                 [contentsArray enumerateObjectsUsingBlock:^(id renderers, NSUInteger idx, BOOL *stop) {
+                    // Check for promoted video renderers
                     SEL itemSec = NSSelectorFromString(@"itemSectionRenderer");
                     if (![renderers respondsToSelector:itemSec]) return;
                     id sectionRenderer = ((id(*)(id, SEL))objc_msgSend)(renderers, itemSec);
@@ -125,17 +90,37 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
                     SEL contentsSel = NSSelectorFromString(@"contentsArray");
                     if (![sectionRenderer respondsToSelector:contentsSel]) return;
                     NSArray *contents = ((id(*)(id, SEL))objc_msgSend)(sectionRenderer, contentsSel);
+                    if (!contents || contents.count == 0) return;
                     id firstObject = [contents firstObject];
                     if (!firstObject) return;
                     
-                    SEL hasPromo = NSSelectorFromString(@"hasPromotedVideoRenderer");
-                    SEL hasCompactPromo = NSSelectorFromString(@"hasCompactPromotedVideoRenderer");
-                    SEL hasInlineMuted = NSSelectorFromString(@"hasPromotedVideoInlineMutedRenderer");
+                    // Check all known promoted renderer types
+                    NSArray *promoSelectors = @[
+                        @"hasPromotedVideoRenderer",
+                        @"hasCompactPromotedVideoRenderer",
+                        @"hasPromotedVideoInlineMutedRenderer",
+                        @"hasAdSlotRenderer",
+                        @"hasStatementBannerRenderer",
+                        @"hasBrandVideoShelfRenderer",
+                        @"hasBrandVideoSingletonRenderer",
+                    ];
                     
-                    BOOL isPromo = ([firstObject respondsToSelector:hasPromo] && ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, hasPromo)) ||
-                                   ([firstObject respondsToSelector:hasCompactPromo] && ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, hasCompactPromo)) ||
-                                   ([firstObject respondsToSelector:hasInlineMuted] && ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, hasInlineMuted));
-                    if (isPromo) [removeIndexes addIndex:idx];
+                    for (NSString *selName in promoSelectors) {
+                        SEL sel = NSSelectorFromString(selName);
+                        if ([firstObject respondsToSelector:sel] &&
+                            ((BOOL(*)(id,SEL))objc_msgSend)(firstObject, sel)) {
+                            [removeIndexes addIndex:idx];
+                            return;
+                        }
+                    }
+                    
+                    // Also check for ad logging data on section renderer
+                    SEL hasAdLog = NSSelectorFromString(@"hasAdLoggingData");
+                    if ([sectionRenderer respondsToSelector:hasAdLog] &&
+                        ((BOOL(*)(id,SEL))objc_msgSend)(sectionRenderer, hasAdLog)) {
+                        [removeIndexes addIndex:idx];
+                        return;
+                    }
                 }];
                 if (removeIndexes.count > 0) {
                     [contentsArray removeObjectsAtIndexes:removeIndexes];
@@ -143,10 +128,9 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
             }
         }
     } @catch (NSException *e) {
-        // Silently ignore — don't crash the feed
+        // Don't crash the feed
     }
     
-    // Always call original
     if (orig_loadWithModel) {
         ((void(*)(id, SEL, id))orig_loadWithModel)(self, _cmd, model);
     }
@@ -257,10 +241,6 @@ static void registerAllHooks(void) {
     // YTAccountScopedAdsInnerTubeContextDecorator -decorateContext:
     cls = objc_getClass("YTAccountScopedAdsInnerTubeContextDecorator");
     if (cls) hookMethod(cls, @selector(decorateContext:), (IMP)hook_decorateContext);
-
-    // YTIElementRenderer -elementData
-    cls = objc_getClass("YTIElementRenderer");
-    if (cls) orig_elementData = hookMethod(cls, @selector(elementData), (IMP)hook_elementData);
 
     // YTSectionListViewController -loadWithModel:
     cls = objc_getClass("YTSectionListViewController");
