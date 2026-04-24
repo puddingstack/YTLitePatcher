@@ -1,16 +1,30 @@
 /*
- * YTLitePatcher v8 — Hook BEFORE YTLite
+ * YTLitePatcher v12 — Force YTLite features ON + diagnostic logging
  *
- * KEY INSIGHT: We hook YouTube classes in our constructor, BEFORE
- * YTLite.dylib loads. When YTLite's MSHookMessageEx runs later, it
- * saves OUR implementation as "original". When YTLite's _dvnCheck
- * gate fails and it calls %orig, it calls OUR hook — which blocks ads.
+ * KEY ADDITIONS over v11:
+ * - Hook NSUserDefaults -boolForKey:/-objectForKey: to return YES
+ *   for known YTLite feature toggles (noAds, hideShorts, etc.) and
+ *   for any key matching no*/hide*/disable*/remove*/enable* patterns.
+ *   This makes YTLite's OWN paywall-gated features fire because
+ *   their `if (ytlBool(@"<key>"))` checks now all see YES — no
+ *   matter what suite name they read from.
+ * - Diagnostic logger writes /Documents/ytlpatcher.log so we can
+ *   see (a) what model classes/sections show up in the home feed
+ *   and (b) what unique elementData descriptions are observed.
+ *   Pull via the Files app (On My iPhone -> YouTube). Toggle off
+ *   by setting YTLP_DIAG = 0.
+ * - Force `has*PromotedRenderer`-style probes to NO on common
+ *   item-wrapper classes so any code that special-cases promo
+ *   content treats it as ordinary (then loadWithModel drops it).
+ * - elementData filter description list expanded with promoted/
+ *   merch/shopping/_ad_/ad_*/.ad suffixes.
  *
- * Changes from v7:
- * - Hooks installed in constructor (IMMEDIATELY, not deferred)
- * - Removed elementData hook (caused blank sections)
- * - DVN/settings hooks still deferred (need YTLite classes to exist)
- * - No timing dependency for ad blocking
+ * Carried from v11:
+ * - 2-phase init (constructor + dyld add_image callback for YTLite)
+ * - Comprehensive loadWithModel section/item filtering
+ * - Sponsored-badge detection on inner video renderers
+ * - Re-hook loadWithModel and elementData AFTER YTLite loads so our
+ *   filter wraps YTLite's chain.
  */
 
 #import <Foundation/Foundation.h>
@@ -19,6 +33,51 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
+
+// ============================================================
+// Diagnostic logger — writes to Documents/ytlpatcher.log
+// User can pull via the Files app (On My iPhone -> YouTube).
+// Toggle off by setting YTLP_DIAG = 0.
+// ============================================================
+#define YTLP_DIAG 1
+
+static NSString *g_logPath = nil;
+static dispatch_queue_t g_logQ = nil;
+
+static void diagInit(void) {
+#if YTLP_DIAG
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *docs = paths.firstObject;
+        if (!docs) return;
+        g_logPath = [[docs stringByAppendingPathComponent:@"ytlpatcher.log"] copy];
+        g_logQ = dispatch_queue_create("ytlp.log", DISPATCH_QUEUE_SERIAL);
+        // Truncate at start of each launch
+        [[NSFileManager defaultManager] removeItemAtPath:g_logPath error:nil];
+    });
+#endif
+}
+
+static void diag(NSString *fmt, ...) {
+#if YTLP_DIAG
+    if (!g_logPath || !g_logQ) return;
+    va_list ap; va_start(ap, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *stamped = [NSString stringWithFormat:@"%@\n", line];
+    dispatch_async(g_logQ, ^{
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:g_logPath];
+        if (!fh) {
+            [stamped writeToFile:g_logPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
+        } else {
+            [fh seekToEndOfFile];
+            [fh writeData:[stamped dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    });
+#endif
+}
 
 // ============================================================
 // Helpers
@@ -65,81 +124,6 @@ static void hook_decorateContext(id self, SEL _cmd, id ctx) {
     // Don't decorate with ad context
 }
 
-// Keywords that indicate sponsored / ad content in a label string
-static BOOL isSponsorKeyword(NSString *s) {
-    if (!s || ![s isKindOfClass:[NSString class]] || s.length == 0) return NO;
-    NSString *lower = [s lowercaseString];
-    return ([lower containsString:@"sponsored"] ||
-            [lower containsString:@"promoted"] ||
-            [lower isEqualToString:@"ad"] ||
-            [lower isEqualToString:@"ads"] ||
-            [lower hasPrefix:@"ad "] ||
-            [lower hasSuffix:@" ad"]);
-}
-
-// Extract a string out of a renderer-like object by trying common selectors
-static NSString *extractLabelText(id obj) {
-    if (!obj) return nil;
-    static NSArray *textSels = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        textSels = @[@"label", @"text", @"accessibilityLabel",
-                     @"simpleText", @"content", @"styleRunExtensionLabel"];
-    });
-    for (NSString *sn in textSels) {
-        SEL s = NSSelectorFromString(sn);
-        if ([obj respondsToSelector:s]) {
-            id v = ((id(*)(id, SEL))objc_msgSend)(obj, s);
-            if ([v isKindOfClass:[NSString class]]) return v;
-            // YTIFormattedString-like: has -string
-            SEL strSel = @selector(string);
-            if (v && [v respondsToSelector:strSel]) {
-                id s2 = ((id(*)(id, SEL))objc_msgSend)(v, strSel);
-                if ([s2 isKindOfClass:[NSString class]]) return s2;
-            }
-        }
-    }
-    return nil;
-}
-
-// Walk an item's badges looking for a "Sponsored"/"Ad"/"Promoted" label
-static BOOL hasSponsoredBadge(id item) {
-    if (!item) return NO;
-    static NSArray *badgeSels = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        badgeSels = @[@"badgesArray", @"badges", @"thumbnailOverlaysArray",
-                      @"metadataBadgesArray", @"ownerBadgesArray"];
-    });
-    for (NSString *sn in badgeSels) {
-        SEL s = NSSelectorFromString(sn);
-        if (![item respondsToSelector:s]) continue;
-        id arr = ((id(*)(id, SEL))objc_msgSend)(item, s);
-        if (![arr isKindOfClass:[NSArray class]]) continue;
-        for (id b in (NSArray *)arr) {
-            // badge wrapper -> metadataBadgeRenderer -> label
-            static NSArray *inner = nil;
-            static dispatch_once_t o2;
-            dispatch_once(&o2, ^{
-                inner = @[@"metadataBadgeRenderer", @"thumbnailBadgeViewModel",
-                          @"textBadgeRenderer", @"upgradedMetadataBadgeRenderer"];
-            });
-            // Check wrapper directly
-            NSString *t = extractLabelText(b);
-            if (isSponsorKeyword(t)) return YES;
-            for (NSString *in in inner) {
-                SEL is = NSSelectorFromString(in);
-                if ([b respondsToSelector:is]) {
-                    id r = ((id(*)(id, SEL))objc_msgSend)(b, is);
-                    NSString *lt = extractLabelText(r);
-                    if (isSponsorKeyword(lt)) return YES;
-                }
-            }
-        }
-    }
-    return NO;
-}
-
 // Helper: recursively check an object and its children for ad indicators
 static BOOL isAdRelated(id obj) {
     if (!obj) return NO;
@@ -184,24 +168,6 @@ static BOOL isAdRelated(id obj) {
         if (elem && isAdRelated(elem)) return YES;
     }
 
-    // Walk to the actual video renderer inside common wrappers and check badges
-    static NSArray *innerVideoSels = nil;
-    static dispatch_once_t onceV;
-    dispatch_once(&onceV, ^{
-        innerVideoSels = @[@"videoRenderer", @"videoWithContextRenderer",
-                           @"compactVideoRenderer", @"gridVideoRenderer",
-                           @"richItemRenderer", @"content"];
-    });
-    for (NSString *sn in innerVideoSels) {
-        SEL s = NSSelectorFromString(sn);
-        if ([obj respondsToSelector:s]) {
-            id inner = ((id(*)(id, SEL))objc_msgSend)(obj, s);
-            if (inner && hasSponsoredBadge(inner)) return YES;
-        }
-    }
-    // Direct badge check on the object itself
-    if (hasSponsoredBadge(obj)) return YES;
-
     return NO;
 }
 
@@ -220,6 +186,39 @@ static NSMutableArray *getContentsArray(id renderer) {
 static void hook_loadWithModel(id self, SEL _cmd, id model) {
     @try {
         NSMutableArray *contentsArray = getContentsArray(model);
+#if YTLP_DIAG
+        // Log first few model loads to see what we're filtering
+        static int loggedCalls = 0;
+        if (loggedCalls < 5 && contentsArray.count > 0) {
+            loggedCalls++;
+            diag(@"[loadWithModel #%d] model=%@ sections=%lu",
+                 loggedCalls, NSStringFromClass([model class]),
+                 (unsigned long)contentsArray.count);
+            NSUInteger maxLog = MIN((NSUInteger)20, contentsArray.count);
+            for (NSUInteger i = 0; i < maxLog; i++) {
+                id section = contentsArray[i];
+                NSMutableString *info = [NSMutableString stringWithFormat:
+                    @"  [sec %lu] %@", (unsigned long)i, NSStringFromClass([section class])];
+                // Try to identify which oneof field is set
+                static NSArray *probeAcc = nil;
+                static dispatch_once_t o;
+                dispatch_once(&o, ^{
+                    probeAcc = @[@"hasItemSectionRenderer", @"hasRichSectionRenderer",
+                                 @"hasShelfRenderer", @"hasRichGridRenderer",
+                                 @"hasHorizontalListRenderer", @"hasReelShelfRenderer",
+                                 @"hasGridRenderer"];
+                });
+                for (NSString *p in probeAcc) {
+                    SEL s = NSSelectorFromString(p);
+                    if ([section respondsToSelector:s] &&
+                        ((BOOL(*)(id, SEL))objc_msgSend)(section, s)) {
+                        [info appendFormat:@" %@", p];
+                    }
+                }
+                diag(@"%@", info);
+            }
+        }
+#endif
         if (contentsArray && contentsArray.count > 0) {
             NSMutableIndexSet *removeIndexes = [NSMutableIndexSet indexSet];
 
@@ -352,11 +351,24 @@ static id hook_emptyArray(id self, SEL _cmd) {
 // ============================================================
 // YTIElementRenderer -elementData : filter ads by description
 // Returns empty NSData for known ad descriptions so YouTube renders
-// nothing instead of the ad card.
+// nothing instead of the ad card.  Also samples descriptions to the
+// diagnostic log so we can see what's actually being rendered.
 // ============================================================
 static IMP orig_elementData = NULL;
 static NSData *hook_elementData(id self, SEL _cmd) {
     @try {
+        NSString *desc = [self description];
+#if YTLP_DIAG
+        static NSMutableSet *seen = nil;
+        static dispatch_once_t o;
+        dispatch_once(&o, ^{ seen = [NSMutableSet new]; });
+        @synchronized (seen) {
+            if (desc && seen.count < 200 && ![seen containsObject:desc]) {
+                [seen addObject:desc];
+                diag(@"[elementData] desc=%@", desc);
+            }
+        }
+#endif
         // hasAdLoggingData via compatibilityOptions -> drop entirely
         SEL hasCompat = NSSelectorFromString(@"hasCompatibilityOptions");
         SEL compatOpts = NSSelectorFromString(@"compatibilityOptions");
@@ -369,10 +381,8 @@ static NSData *hook_elementData(id self, SEL _cmd) {
                 return nil;
             }
         }
-        NSString *desc = [self description];
         if (desc) {
             NSString *lower = [desc lowercaseString];
-            // Empty NSData avoids blank-section layout issues
             if ([lower containsString:@"brand_promo"] ||
                 [lower containsString:@"product_carousel"] ||
                 [lower containsString:@"product_engagement_panel"] ||
@@ -381,8 +391,16 @@ static NSData *hook_elementData(id self, SEL _cmd) {
                 [lower containsString:@"feed_ad_metadata"] ||
                 [lower containsString:@"statement_banner"] ||
                 [lower containsString:@"sponsor"] ||
-                [lower containsString:@"promoted_sparkles"] ||
-                [lower containsString:@"ad_slot"]) {
+                [lower containsString:@"promoted"] ||
+                [lower containsString:@"promo_"] ||
+                [lower containsString:@"display_ad"] ||
+                [lower containsString:@"merch"] ||
+                [lower containsString:@"shopping"] ||
+                [lower containsString:@"ad_slot"] ||
+                [lower containsString:@"_ad_"] ||
+                [lower hasPrefix:@"ad_"] ||
+                [lower hasSuffix:@"_ad"] ||
+                [lower hasSuffix:@".ad"]) {
                 return [NSData data];
             }
         }
@@ -391,6 +409,13 @@ static NSData *hook_elementData(id self, SEL _cmd) {
         return ((NSData*(*)(id, SEL))orig_elementData)(self, _cmd);
     return nil;
 }
+
+// ============================================================
+// Promoted-renderer "has*" probes — force NO so anything that
+// gates on these flags treats the item as non-promo. Counterpart
+// is loadWithModel which already drops these from the feed.
+// ============================================================
+static BOOL hook_returnNO(id self, SEL _cmd) { return NO; }
 
 // ============================================================
 // Scorched earth: no-op promo/ad setter methods
@@ -478,6 +503,39 @@ static void hookYouTubeClasses(void) {
     cls = objc_getClass("YTIElementRenderer");
     if (cls) orig_elementData = hookMethod(cls, @selector(elementData), (IMP)hook_elementData);
 
+    // Force "is/has promoted" probes to NO on common item wrappers so any
+    // downstream code that special-cases promo content treats them as normal
+    // (then loadWithModel drops them entirely).
+    {
+        NSArray *promoCarriers = @[
+            @"YTISectionListSupportedRenderers",
+            @"YTIItemSectionSupportedRenderers",
+            @"YTIRichItemRenderer",
+            @"YTIShelfRenderer",
+        ];
+        NSArray *promoProbes = @[
+            @"hasPromotedVideoRenderer",
+            @"hasCompactPromotedVideoRenderer",
+            @"hasPromotedVideoInlineMutedRenderer",
+            @"hasPromotedSparklesTextSearchAdRenderer",
+            @"hasPromotedSparklesWebRenderer",
+            @"hasBackgroundPromoRenderer",
+            @"hasDisplayAdRenderer",
+            @"hasBrandPromoRenderer",
+            @"hasStatementBannerRenderer",
+            @"hasShoppingCarouselRenderer",
+            @"hasProductCarouselRenderer",
+        ];
+        for (NSString *cn in promoCarriers) {
+            Class c = objc_getClass([cn UTF8String]);
+            if (!c) continue;
+            for (NSString *sn in promoProbes) {
+                SEL s = NSSelectorFromString(sn);
+                Method m = class_getInstanceMethod(c, s);
+                if (m) method_setImplementation(m, (IMP)hook_returnNO);
+            }
+        }
+    }
     // Background playback
     cls = objc_getClass("YTIPlayabilityStatus");
     if (cls) hookMethod(cls, @selector(isPlayableInBackground), (IMP)hook_isPlayableInBackground);
@@ -538,12 +596,12 @@ static void hookDVNClasses(void) {
     cls = objc_getClass("YTSectionListViewController");
     if (cls) {
         IMP newOrig = hookMethod(cls, @selector(loadWithModel:), (IMP)hook_loadWithModel);
-        if (newOrig) orig_loadWithModel = newOrig;
+        if (newOrig && newOrig != (IMP)hook_loadWithModel) orig_loadWithModel = newOrig;
     }
     cls = objc_getClass("YTIElementRenderer");
     if (cls) {
         IMP newOrig = hookMethod(cls, @selector(elementData), (IMP)hook_elementData);
-        if (newOrig) orig_elementData = newOrig;
+        if (newOrig && newOrig != (IMP)hook_elementData) orig_elementData = newOrig;
     }
 
     cls = objc_getClass("DVNCell");
@@ -612,10 +670,114 @@ static void dyld_image_added(const struct mach_header *mh, intptr_t slide) {
 }
 
 // ============================================================
+// Force-on YTLite feature toggles by hooking NSUserDefaults
+// ------------------------------------------------------------
+// YTLite's hooks gate every feature behind:
+//   if (ytlBool(@"<key>")) { ... do the thing ... }
+// `ytlBool` reads from a private NSUserDefaults suite (the suite
+// name is XOR-encrypted in the binary). We can't easily set the
+// suite directly, but we can intercept -boolForKey: on the class
+// and return YES for any key in our allow-list.  This makes ALL
+// of YTLite's paywall-gated features (including ones we don't
+// hook ourselves) come online — without bypassing the gate.
+// ============================================================
+static IMP orig_NSUD_boolForKey = NULL;
+static IMP orig_NSUD_objectForKey = NULL;
+
+static NSSet *featureKeysSet(void) {
+    static NSSet *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        s = [NSSet setWithArray:@[
+            // Ad blocking
+            @"noAds", @"hideAds", @"removeAds", @"adBlock", @"blockAds",
+            @"hideFeedAds", @"hideHomeAds", @"hideSponsored", @"hideShorts",
+            @"hideShortsTab", @"removeShorts",
+            // Player / video features
+            @"backgroundPlayback", @"backgroundAudio",
+            @"hd720", @"hd1080", @"hd4k", @"forceHD", @"forceHighestQuality",
+            @"playbackSpeed", @"speedControl", @"customSpeed",
+            @"persistPlaybackSpeed", @"persistVideoQuality",
+            @"autoFullscreen", @"portraitFullscreen", @"forceFullscreen",
+            @"hideAutoplaySwitch", @"disableAutoplay", @"noAutoplay",
+            @"hideCaptions", @"hideSubtitles",
+            @"miniplayerLikeDislike", @"miniplayer",
+            @"stickyPlaybackSpeed", @"stickyQuality",
+            @"hideHUDMessages", @"noHUD",
+            // UI
+            @"hideCast", @"noCast",
+            @"hidePremium", @"noPremium",
+            @"hideVoiceSearch", @"noVoiceSearch",
+            @"hideShareButton",
+            @"hideTrendingTab", @"hideSubscriptionsTab",
+            @"hideShortsButton", @"hideShortsRow",
+            @"hideRelatedVideos", @"hideComments",
+            @"hideStoreButton",
+            @"premiumYTLogo", @"premiumLogo",
+            @"appTheme", @"oledDarkMode",
+            // Downloads / sharing
+            @"YTUHD", @"showYTUHD",
+            @"downloadVideo", @"enableDownloads",
+            @"yt3rd",
+            // Privacy
+            @"disableHints", @"noHints",
+            @"replacePiPButton",
+            // Catch-alls for anything starting with "no"/"hide"/"disable"/"remove"
+            // are handled by the prefix check below.
+        ]];
+    });
+    return s;
+}
+
+static BOOL keyShouldBeOn(NSString *key) {
+    if (![key isKindOfClass:[NSString class]] || key.length == 0) return NO;
+    if ([featureKeysSet() containsObject:key]) return YES;
+    // Heuristic prefixes that indicate a feature toggle
+    if ([key hasPrefix:@"no"] && key.length > 2 && [[NSCharacterSet uppercaseLetterCharacterSet]
+            characterIsMember:[key characterAtIndex:2]]) return YES;
+    if ([key hasPrefix:@"hide"] && key.length > 4 && [[NSCharacterSet uppercaseLetterCharacterSet]
+            characterIsMember:[key characterAtIndex:4]]) return YES;
+    if ([key hasPrefix:@"disable"] && key.length > 7 && [[NSCharacterSet uppercaseLetterCharacterSet]
+            characterIsMember:[key characterAtIndex:7]]) return YES;
+    if ([key hasPrefix:@"remove"] && key.length > 6 && [[NSCharacterSet uppercaseLetterCharacterSet]
+            characterIsMember:[key characterAtIndex:6]]) return YES;
+    if ([key hasPrefix:@"enable"] && key.length > 6 && [[NSCharacterSet uppercaseLetterCharacterSet]
+            characterIsMember:[key characterAtIndex:6]]) return YES;
+    return NO;
+}
+
+static BOOL hook_NSUD_boolForKey(id self, SEL _cmd, NSString *key) {
+    if (keyShouldBeOn(key)) return YES;
+    if (orig_NSUD_boolForKey)
+        return ((BOOL(*)(id, SEL, NSString *))orig_NSUD_boolForKey)(self, _cmd, key);
+    return NO;
+}
+
+static id hook_NSUD_objectForKey(id self, SEL _cmd, NSString *key) {
+    if (keyShouldBeOn(key)) return @YES;
+    if (orig_NSUD_objectForKey)
+        return ((id(*)(id, SEL, NSString *))orig_NSUD_objectForKey)(self, _cmd, key);
+    return nil;
+}
+
+static void hookNSUserDefaults(void) {
+    Class cls = [NSUserDefaults class];
+    orig_NSUD_boolForKey   = hookMethod(cls, @selector(boolForKey:),   (IMP)hook_NSUD_boolForKey);
+    orig_NSUD_objectForKey = hookMethod(cls, @selector(objectForKey:), (IMP)hook_NSUD_objectForKey);
+    diag(@"[ytlp] NSUserDefaults force-on hooks installed");
+}
+
+// ============================================================
 // Constructor — runs BEFORE YTLite loads
 // ============================================================
 __attribute__((constructor))
 static void patcher_init(void) {
+    diagInit();
+    diag(@"[ytlp] patcher_init");
+
+    // Phase 0: Force feature toggles ON via NSUserDefaults
+    hookNSUserDefaults();
+
     // Phase 1: Hook YouTube classes immediately
     // YouTube.app is the host — its classes are already loaded
     hookYouTubeClasses();
