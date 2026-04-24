@@ -1,21 +1,18 @@
 /*
- * YTLitePatcher v4
+ * YTLitePatcher v5 — Safe baseline
  *
- * Two-pronged approach:
+ * REMOVED all dangerous operations that caused crashes:
+ * - NO Mach-O symbol table parsing (crashed on bad addresses)
+ * - NO memory writes to C symbols (SIGBUS on __TEXT pages)
+ * - NO static binary patching (corrupted dylib code section)
+ * - FIXED dylib name matching ("YTLite.dylib" not just "YTLite")
  *
- * STATIC (in CI): The workflow uses LIEF to zero out _dvnCheck/_dvnLocked
- *   in YTLite.dylib BEFORE injecting into the IPA. This is the primary
- *   bypass — it modifies the __DATA segment directly in the binary file.
+ * This version does ONLY safe ObjC runtime swizzling.
+ * It hooks DVNPatreonContext auth methods, DVNCell lock state,
+ * WelcomeVC, and patreonSection.
  *
- * RUNTIME (this file): Deferred ObjC hooks that apply AFTER YTLite's
- *   constructor has finished running. Fixes the settings UI (lock icons,
- *   patreon section, welcome screen). Also periodically re-zeroes
- *   _dvnCheck/_dvnLocked in case YTLite resets them at runtime.
- *
- * KEY FIX from v3: hooks are deferred by 1 second via dispatch_after
- *   so YTLite's %ctor completes first. Previously, _dyld_register_func_
- *   for_add_image fired BEFORE constructors, causing hooks to either
- *   find NULL classes or corrupt YTLite's initialization.
+ * Purpose: establish a non-crashing baseline to determine
+ * if ObjC hooks alone can bypass the paywall.
  */
 
 #import <Foundation/Foundation.h>
@@ -24,48 +21,6 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
-#import <mach-o/loader.h>
-#import <mach-o/nlist.h>
-
-// ============================================================
-// Mach-O private symbol finder
-// ============================================================
-static void *findPrivateSymbol(const struct mach_header *header, intptr_t slide, const char *symbolName) {
-    if (!header || !symbolName) return NULL;
-
-    const struct mach_header_64 *h64 = (const struct mach_header_64 *)header;
-    struct load_command *cmd = (struct load_command *)((uintptr_t)h64 + sizeof(struct mach_header_64));
-
-    struct symtab_command *symtabCmd = NULL;
-    uintptr_t linkeditBase = 0;
-
-    for (uint32_t i = 0; i < h64->ncmds; i++) {
-        if (cmd->cmd == LC_SYMTAB) {
-            symtabCmd = (struct symtab_command *)cmd;
-        } else if (cmd->cmd == LC_SEGMENT_64) {
-            struct segment_command_64 *seg = (struct segment_command_64 *)cmd;
-            if (strcmp(seg->segname, SEG_LINKEDIT) == 0) {
-                linkeditBase = (uintptr_t)(seg->vmaddr - seg->fileoff + slide);
-            }
-        }
-        cmd = (struct load_command *)((uintptr_t)cmd + cmd->cmdsize);
-    }
-
-    if (!symtabCmd || !linkeditBase) return NULL;
-
-    struct nlist_64 *symtab = (struct nlist_64 *)(linkeditBase + symtabCmd->symoff);
-    const char *strtab = (const char *)(linkeditBase + symtabCmd->stroff);
-
-    for (uint32_t i = 0; i < symtabCmd->nsyms; i++) {
-        const char *name = &strtab[symtab[i].n_un.n_strx];
-        if (strcmp(name, symbolName) == 0) {
-            uint64_t addr = symtab[i].n_value;
-            if (addr == 0) continue;
-            return (void *)(addr + slide);
-        }
-    }
-    return NULL;
-}
 
 // ============================================================
 // ObjC helpers
@@ -89,7 +44,7 @@ static void forceReturnNO(Class cls, SEL sel) {
 }
 
 // ============================================================
-// Replacement functions
+// Replacements
 // ============================================================
 static IMP orig_DVNCell_setLocked;
 static void rep_DVNCell_setLocked(id self, SEL _cmd, BOOL locked) {
@@ -114,7 +69,8 @@ static void rep_WelcomeVC_viewDidLoad(id self, SEL _cmd) {
 
 static IMP orig_patreonSection;
 static id rep_patreonSection(id self, SEL _cmd) {
-    id section = orig_patreonSection ? ((id(*)(id, SEL))orig_patreonSection)(self, _cmd) : nil;
+    id section = orig_patreonSection
+        ? ((id(*)(id, SEL))orig_patreonSection)(self, _cmd) : nil;
     if (section) {
         SEL setCells = NSSelectorFromString(@"setCells:");
         if ([section respondsToSelector:setCells])
@@ -124,31 +80,15 @@ static id rep_patreonSection(id self, SEL _cmd) {
 }
 
 // ============================================================
-// Stored symbol addresses for periodic re-patching
-// ============================================================
-static void *g_dvnCheckAddr = NULL;
-static void *g_dvnLockedAddr = NULL;
-
-static void zeroDvnFlags(void) {
-    if (g_dvnCheckAddr)  *((uint32_t *)g_dvnCheckAddr) = 0;
-    if (g_dvnLockedAddr) *((uint32_t *)g_dvnLockedAddr) = 0;
-}
-
-// ============================================================
-// Main hook registration — called AFTER YTLite initializes
+// Hook registration — called after YTLite init completes
 // ============================================================
 static BOOL g_hooked = NO;
 
-static void registerAllHooks(const struct mach_header *mh, intptr_t slide) {
+static void registerAllHooks(void) {
     if (g_hooked) return;
     g_hooked = YES;
 
-    // -- Find and zero _dvnCheck/_dvnLocked (runtime backup for static patch) --
-    g_dvnCheckAddr = findPrivateSymbol(mh, slide, "_dvnCheck");
-    g_dvnLockedAddr = findPrivateSymbol(mh, slide, "_dvnLocked");
-    zeroDvnFlags();
-
-    // -- DVNCell --
+    // -- DVNCell: unlock all cells --
     Class dvnCell = objc_getClass("DVNCell");
     if (dvnCell) {
         swizzleMethod(dvnCell, @selector(setLocked:),
@@ -157,7 +97,7 @@ static void registerAllHooks(const struct mach_header *mh, intptr_t slide) {
         forceReturnNO(dvnCell, @selector(locked));
     }
 
-    // -- DVNTableViewController --
+    // -- DVNTableViewController: unlock --
     Class dvnTVC = objc_getClass("DVNTableViewController");
     if (dvnTVC) {
         Method m = class_getInstanceMethod(dvnTVC, @selector(setLocked:));
@@ -167,7 +107,7 @@ static void registerAllHooks(const struct mach_header *mh, intptr_t slide) {
         forceReturnNO(dvnTVC, @selector(isLocked));
     }
 
-    // -- DVNPatreonContext --
+    // -- DVNPatreonContext: force all auth checks to YES --
     Class patreonCtx = objc_getClass("DVNPatreonContext");
     if (patreonCtx) {
         SEL authSels[] = {
@@ -181,14 +121,14 @@ static void registerAllHooks(const struct mach_header *mh, intptr_t slide) {
         }
     }
 
-    // -- WelcomeVC --
+    // -- WelcomeVC: auto-dismiss login screen --
     Class welcomeVC = objc_getClass("WelcomeVC");
     if (welcomeVC) {
         swizzleMethod(welcomeVC, @selector(viewDidLoad),
                       (IMP)rep_WelcomeVC_viewDidLoad, &orig_WelcomeVC_viewDidLoad);
     }
 
-    // -- YTPSettingsBuilder --
+    // -- YTPSettingsBuilder: empty patreon section --
     Class settingsBuilder = objc_getClass("YTPSettingsBuilder");
     if (settingsBuilder) {
         Method m = class_getInstanceMethod(settingsBuilder,
@@ -198,39 +138,26 @@ static void registerAllHooks(const struct mach_header *mh, intptr_t slide) {
             method_setImplementation(m, (IMP)rep_patreonSection);
         }
     }
-
-    // -- Periodic re-zero of _dvnCheck/_dvnLocked --
-    // YTLite may reset these during runtime (e.g. on settings change)
-    if (g_dvnCheckAddr || g_dvnLockedAddr) {
-        // Re-zero every 3 seconds for 60 seconds
-        for (int i = 1; i <= 20; i++) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, i * 3 * NSEC_PER_SEC),
-                           dispatch_get_main_queue(), ^{ zeroDvnFlags(); });
-        }
-    }
 }
 
 // ============================================================
-// dyld callback — waits for YTLite.dylib, then DEFERS hooks
+// dyld callback — waits for YTLite.dylib specifically
 // ============================================================
-static const struct mach_header *g_ytliteHeader = NULL;
-static intptr_t g_ytliteSlide = 0;
-
 static void dyld_image_added(const struct mach_header *mh, intptr_t slide) {
     if (g_hooked) return;
 
     Dl_info info;
     if (!dladdr(mh, &info) || !info.dli_fname) return;
-    if (strstr(info.dli_fname, "YTLite") == NULL) return;
 
-    // Store for deferred use
-    g_ytliteHeader = mh;
-    g_ytliteSlide = slide;
+    // Match YTLite.dylib EXACTLY — not "YTLitePatcher.dylib"
+    const char *fname = strrchr(info.dli_fname, '/');
+    fname = fname ? fname + 1 : info.dli_fname;
+    if (strcmp(fname, "YTLite.dylib") != 0) return;
 
-    // DEFER: wait 1 second for YTLite's %ctor to complete
+    // Defer 1 second so YTLite's constructor completes first
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        registerAllHooks(g_ytliteHeader, g_ytliteSlide);
+        registerAllHooks();
     });
 }
 
