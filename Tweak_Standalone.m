@@ -1,5 +1,5 @@
 /*
- * YTLitePatcher v17 - Stable sponsored fallback without layout mutation
+ * YTLitePatcher v18 - Model-first sponsored filtering to reduce blank slots
  *
  * KEY INSIGHT: We hook YouTube classes in our constructor, BEFORE
  * YTLite.dylib loads. When YTLite's MSHookMessageEx runs later, it
@@ -16,6 +16,8 @@
  * - Avoid mutating UICollectionView layout attributes during scroll; that
  *   removed blank slots but caused pagination/reuse jank.
  * - Reset hidden cells on reuse so sponsored fallback state cannot leak.
+ * - Filter more feed/pagination models before cells are created, reducing
+ *   tall blank slots left by rendered-cell fallback hiding.
  */
 
 #import <Foundation/Foundation.h>
@@ -100,6 +102,9 @@ static IMP orig_UICollectionView_layoutSubviews = NULL;
 static IMP orig_UITableView_layoutSubviews = NULL;
 static IMP orig_UICollectionViewCell_prepareForReuse = NULL;
 static IMP orig_UITableViewCell_prepareForReuse = NULL;
+static IMP orig_addSections = NULL;
+static IMP orig_addSectionsFromArray = NULL;
+static IMP orig_setSections = NULL;
 static char kYTLPHiddenAdCellKey;
 
 // ============================================================
@@ -142,7 +147,10 @@ static BOOL stringLooksAdRelated(NSString *value) {
             @"square_image_layout", @"landscape_image_wide_button_layout",
             @"feed_ad_metadata", @"statement_banner", @"promoted",
             @"sponsored", @"sponsor", @"display_ad", @"ad_slot",
-            @"shopping", @"merch", @"paid_content", @"sparkles"
+            @"shopping", @"merch", @"paid_content", @"sparkles",
+            @"feed_sponsored", @"paid_placement", @"promoted_carousel",
+            @"promoted_collection", @"merch_shelf", @"shopping_item",
+            @"shoppable", @"advertiser", @"impression_ping"
         ];
     });
     for (NSString *marker in markers) {
@@ -201,7 +209,7 @@ static BOOL isAdRelated(id obj) {
 
 static BOOL isAdRelatedDepth(id obj, NSUInteger depth) {
     if (!obj) return NO;
-    if (depth > 4) return NO;
+    if (depth > 6) return NO;
 
     if (stringLooksAdRelated(shortDescription(obj))) return YES;
 
@@ -225,6 +233,16 @@ static BOOL isAdRelatedDepth(id obj, NSUInteger depth) {
             @"hasUpsellDialogRenderer",
             @"hasPromoCommand",
             @"hasPromoType",
+            @"hasRichShelfRenderer",
+            @"hasMerchShelfRenderer",
+            @"hasCarouselShelfRenderer",
+            @"hasPromotedCarouselRenderer",
+            @"hasPromotedCollectionRenderer",
+            @"hasShoppableItemRenderer",
+            @"hasShoppingItemRenderer",
+            @"hasVideoWithContextRenderer",
+            @"hasSponsorshipBadgeRenderer",
+            @"hasPaidContentOverlayRenderer",
             @"hasAdLoggingData",
         ];
     });
@@ -254,12 +272,32 @@ static BOOL isAdRelatedDepth(id obj, NSUInteger depth) {
             @"promoCommand", @"badgeRenderer", @"metadataBadgeRenderer",
             @"adBadgeRenderer", @"headerRenderer", @"contentRenderer",
             @"videoRenderer", @"compactVideoRenderer", @"gridVideoRenderer",
-            @"richItemRenderer"
+            @"richItemRenderer", @"richShelfRenderer", @"merchShelfRenderer",
+            @"carouselShelfRenderer", @"promotedCarouselRenderer",
+            @"promotedCollectionRenderer", @"shoppingItemRenderer",
+            @"shoppableItemRenderer", @"sponsorshipBadgeRenderer"
         ];
     });
     for (NSString *accessor in objectAccessors) {
         id child = safeObjectForSelector(obj, accessor);
         if (child && child != obj && isAdRelatedDepth(child, depth + 1)) return YES;
+    }
+
+    static NSArray *arrayAccessors = nil;
+    static dispatch_once_t onceToken3;
+    dispatch_once(&onceToken3, ^{
+        arrayAccessors = @[
+            @"badgesArray", @"trackingParamsArray", @"impressionPingUrlsArray"
+        ];
+    });
+    for (NSString *accessor in arrayAccessors) {
+        id array = safeObjectForSelector(obj, accessor);
+        if (![array isKindOfClass:[NSArray class]]) continue;
+        NSUInteger checked = 0;
+        for (id child in (NSArray *)array) {
+            if (++checked > 16) break;
+            if (child && child != obj && isAdRelatedDepth(child, depth + 1)) return YES;
+        }
     }
 
     return NO;
@@ -427,15 +465,18 @@ static NSMutableArray *getContentsArray(id renderer) {
     return nil;
 }
 
-// YTSectionListViewController -loadWithModel: -> comprehensive ad filtering
-static void hook_loadWithModel(id self, SEL _cmd, id model) {
+static NSUInteger filterFeedModel(id model, NSString *hookPoint) {
+    NSUInteger removedTotal = 0;
     @try {
         NSMutableArray *contentsArray = getContentsArray(model);
+        if (!contentsArray && [model isKindOfClass:[NSMutableArray class]]) {
+            contentsArray = (NSMutableArray *)model;
+        }
         static int loggedCalls = 0;
         if (contentsArray && contentsArray.count > 0 && loggedCalls < 8) {
             loggedCalls++;
-            diag(@"[loadWithModel #%d] vc=%@ model=%@ sections=%lu",
-                 loggedCalls, NSStringFromClass([self class]), NSStringFromClass([model class]),
+            diag(@"[model-filter %@ #%d] model=%@ sections=%lu",
+                 hookPoint ?: @"unknown", loggedCalls, NSStringFromClass([model class]),
                  (unsigned long)contentsArray.count);
             NSUInteger maxSections = MIN((NSUInteger)24, contentsArray.count);
             for (NSUInteger i = 0; i < maxSections; i++) {
@@ -520,13 +561,18 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
                             // Also check first-level sub-items (for nested renderers)
                             NSMutableArray *subContents = getContentsArray(item);
                             if (subContents) {
+                                NSMutableIndexSet *subRemoveIndexes = [NSMutableIndexSet indexSet];
+                                NSUInteger subIdx = 0;
                                 for (id subItem in subContents) {
                                     if (isAdRelated(subItem)) {
-                                        sectionIsAd = YES;
-                                        break;
+                                        [subRemoveIndexes addIndex:subIdx];
                                     }
+                                    subIdx++;
                                 }
-                                if (sectionIsAd) break;
+                                if (subRemoveIndexes.count > 0) {
+                                    [subContents removeObjectsAtIndexes:subRemoveIndexes];
+                                    removedTotal += subRemoveIndexes.count;
+                                }
                             }
                         }
 
@@ -538,6 +584,7 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
                         // Remove individual ad items
                         if (itemRemoveIndexes.count > 0) {
                             [contents removeObjectsAtIndexes:itemRemoveIndexes];
+                            removedTotal += itemRemoveIndexes.count;
                         }
 
                         // If section is now empty after removing ads, remove it
@@ -551,13 +598,53 @@ static void hook_loadWithModel(id self, SEL _cmd, id model) {
 
             if (removeIndexes.count > 0) {
                 [contentsArray removeObjectsAtIndexes:removeIndexes];
+                removedTotal += removeIndexes.count;
             }
         }
     } @catch (NSException *e) {}
+    if (removedTotal > 0) {
+        diag(@"[model-filter %@] removed=%lu model=%@", hookPoint ?: @"unknown",
+             (unsigned long)removedTotal, NSStringFromClass([model class]));
+    }
+    return removedTotal;
+}
+
+static id filteredPaginationArgument(id argument, NSString *hookPoint) {
+    if ([argument isKindOfClass:[NSMutableArray class]]) {
+        filterFeedModel(argument, hookPoint);
+        return argument;
+    }
+    if ([argument isKindOfClass:[NSArray class]]) {
+        NSMutableArray *copy = [(NSArray *)argument mutableCopy];
+        filterFeedModel(copy, hookPoint);
+        return copy;
+    }
+    filterFeedModel(argument, hookPoint);
+    return argument;
+}
+
+// YTSectionListViewController -loadWithModel: -> comprehensive ad filtering
+static void hook_loadWithModel(id self, SEL _cmd, id model) {
+    filterFeedModel(model, @"loadWithModel");
 
     if (orig_loadWithModel) {
         ((void(*)(id, SEL, id))orig_loadWithModel)(self, _cmd, model);
     }
+}
+
+static void hook_addSections(id self, SEL _cmd, id sections) {
+    id filtered = filteredPaginationArgument(sections, @"addSections");
+    if (orig_addSections) ((void(*)(id, SEL, id))orig_addSections)(self, _cmd, filtered);
+}
+
+static void hook_addSectionsFromArray(id self, SEL _cmd, id sections) {
+    id filtered = filteredPaginationArgument(sections, @"addSectionsFromArray");
+    if (orig_addSectionsFromArray) ((void(*)(id, SEL, id))orig_addSectionsFromArray)(self, _cmd, filtered);
+}
+
+static void hook_setSections(id self, SEL _cmd, id sections) {
+    id filtered = filteredPaginationArgument(sections, @"setSections");
+    if (orig_setSections) ((void(*)(id, SEL, id))orig_setSections)(self, _cmd, filtered);
 }
 
 // Empty ad slot arrays
@@ -666,7 +753,15 @@ static void hookYouTubeClasses(void) {
 
     // Section list filtering (removes promoted sections from feed)
     cls = objc_getClass("YTSectionListViewController");
-    if (cls) orig_loadWithModel = hookMethod(cls, @selector(loadWithModel:), (IMP)hook_loadWithModel);
+    if (cls) {
+        orig_loadWithModel = hookMethod(cls, @selector(loadWithModel:), (IMP)hook_loadWithModel);
+        orig_addSections = hookMethod(cls, NSSelectorFromString(@"addSections:"), (IMP)hook_addSections);
+        if (orig_addSections) diag(@"[feed-hook] YTSectionListViewController addSections:");
+        orig_addSectionsFromArray = hookMethod(cls, NSSelectorFromString(@"addSectionsFromArray:"), (IMP)hook_addSectionsFromArray);
+        if (orig_addSectionsFromArray) diag(@"[feed-hook] YTSectionListViewController addSectionsFromArray:");
+        orig_setSections = hookMethod(cls, NSSelectorFromString(@"setSections:"), (IMP)hook_setSections);
+        if (orig_setSections) diag(@"[feed-hook] YTSectionListViewController setSections:");
+    }
 
     cls = [UICollectionView class];
     if (cls) orig_UICollectionView_layoutSubviews = hookMethod(cls, @selector(layoutSubviews), (IMP)hook_UICollectionView_layoutSubviews);
@@ -886,7 +981,7 @@ static void hookNSUserDefaults(void) {
 __attribute__((constructor))
 static void patcher_init(void) {
     diagInit();
-    diag(@"[ytlp] patcher_init v13");
+    diag(@"[ytlp] patcher_init v18");
     hookNSUserDefaults();
 
     // Phase 1: Hook YouTube classes immediately
