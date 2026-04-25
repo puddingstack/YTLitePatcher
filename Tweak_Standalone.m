@@ -95,6 +95,7 @@ static IMP orig_loadWithModel = NULL;
 static IMP orig_elementData = NULL;
 static IMP orig_UICollectionView_layoutSubviews = NULL;
 static IMP orig_UITableView_layoutSubviews = NULL;
+static char kYTLPHiddenAdCellKey;
 
 // ============================================================
 // Ad blocking - these hook YouTube classes BEFORE YTLite loads
@@ -329,30 +330,81 @@ static BOOL viewTreeContainsAdDisclosure(UIView *view, NSUInteger depth, NSMutab
     return NO;
 }
 
-static void hideRenderedAdCell(UIView *cell, NSString *source) {
+static BOOL renderedCellHasAdDisclosure(UIView *cell, NSMutableArray *hits) {
+    if (!cell) return NO;
+    return viewTreeContainsAdDisclosure(cell, 0, hits);
+}
+
+static void hideRenderedAdCell(UIView *cell, NSString *source, NSMutableArray *hits) {
     if (!cell || cell.hidden) return;
-    NSMutableArray *hits = [NSMutableArray array];
-    if (!viewTreeContainsAdDisclosure(cell, 0, hits)) return;
     diag(@"[ui-ad-hide] source=%@ cell=%@ frame=%@ hits=%@",
-         source, NSStringFromClass([cell class]), NSStringFromCGRect(cell.frame), hits);
+         source, NSStringFromClass([cell class]), NSStringFromCGRect(cell.frame), hits ?: @[]);
     cell.hidden = YES;
     cell.alpha = 0.0;
     cell.userInteractionEnabled = NO;
+    objc_setAssociatedObject(cell, &kYTLPHiddenAdCellKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void restoreRenderedAdCellIfNeeded(UIView *cell) {
+    if (!cell) return;
+    NSNumber *wasHiddenByPatch = objc_getAssociatedObject(cell, &kYTLPHiddenAdCellKey);
+    if (!wasHiddenByPatch.boolValue) return;
+    cell.hidden = NO;
+    cell.alpha = 1.0;
+    cell.userInteractionEnabled = YES;
+    objc_setAssociatedObject(cell, &kYTLPHiddenAdCellKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void collapseVisibleCellsAfterAdFrames(NSArray *visibleCells, NSArray *adRects) {
+    if (adRects.count == 0) return;
+    for (UIView *cell in visibleCells) {
+        if (cell.hidden) continue;
+        CGRect frame = cell.frame;
+        CGFloat shift = 0.0;
+        for (NSValue *value in adRects) {
+            CGRect adFrame = [value CGRectValue];
+            if (CGRectGetMinY(frame) > CGRectGetMinY(adFrame)) {
+                shift += CGRectGetHeight(adFrame);
+            }
+        }
+        if (shift > 0.0) {
+            frame.origin.y -= shift;
+            cell.frame = frame;
+        }
+    }
 }
 
 static void scanCollectionViewForRenderedAds(UICollectionView *collectionView) {
     @try {
-        for (UICollectionViewCell *cell in [collectionView visibleCells]) {
-            hideRenderedAdCell(cell, @"UICollectionView");
+        NSArray *cells = [collectionView visibleCells];
+        NSMutableArray *adRects = [NSMutableArray array];
+        for (UICollectionViewCell *cell in cells) {
+            NSMutableArray *hits = [NSMutableArray array];
+            if (!renderedCellHasAdDisclosure(cell, hits)) {
+                restoreRenderedAdCellIfNeeded(cell);
+                continue;
+            }
+            [adRects addObject:[NSValue valueWithCGRect:cell.frame]];
+            hideRenderedAdCell(cell, @"UICollectionView", hits);
         }
+        collapseVisibleCellsAfterAdFrames(cells, adRects);
     } @catch (NSException *e) {}
 }
 
 static void scanTableViewForRenderedAds(UITableView *tableView) {
     @try {
-        for (UITableViewCell *cell in [tableView visibleCells]) {
-            hideRenderedAdCell(cell, @"UITableView");
+        NSArray *cells = [tableView visibleCells];
+        NSMutableArray *adRects = [NSMutableArray array];
+        for (UITableViewCell *cell in cells) {
+            NSMutableArray *hits = [NSMutableArray array];
+            if (!renderedCellHasAdDisclosure(cell, hits)) {
+                restoreRenderedAdCellIfNeeded(cell);
+                continue;
+            }
+            [adRects addObject:[NSValue valueWithCGRect:cell.frame]];
+            hideRenderedAdCell(cell, @"UITableView", hits);
         }
+        collapseVisibleCellsAfterAdFrames(cells, adRects);
     } @catch (NSException *e) {}
 }
 
