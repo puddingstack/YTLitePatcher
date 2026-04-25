@@ -466,7 +466,7 @@ static NSMutableArray *getContentsArray(id renderer) {
 }
 
 static NSUInteger filterFeedModel(id model, NSString *hookPoint) {
-    NSUInteger removedTotal = 0;
+    __block NSUInteger removedTotal = 0;
     @try {
         NSMutableArray *contentsArray = getContentsArray(model);
         if (!contentsArray && [model isKindOfClass:[NSMutableArray class]]) {
