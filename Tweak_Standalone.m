@@ -93,6 +93,8 @@ static IMP hookClassMethod(Class cls, SEL sel, IMP newImp) {
 // ============================================================
 static IMP orig_loadWithModel = NULL;
 static IMP orig_elementData = NULL;
+static IMP orig_UICollectionView_layoutSubviews = NULL;
+static IMP orig_UITableView_layoutSubviews = NULL;
 
 // ============================================================
 // Ad blocking - these hook YouTube classes BEFORE YTLite loads
@@ -142,6 +144,16 @@ static BOOL stringLooksAdRelated(NSString *value) {
     }
     return [lower hasPrefix:@"ad_"] || [lower hasSuffix:@"_ad"] ||
            [lower containsString:@"_ad_"] || [lower hasSuffix:@".ad"];
+}
+
+static BOOL stringLooksAdDisclosure(NSString *value) {
+    if (![value isKindOfClass:[NSString class]] || value.length == 0) return NO;
+    NSString *lower = [[value lowercaseString] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if ([lower isEqualToString:@"sponsored"] || [lower containsString:@"sponsored"]) return YES;
+    if ([lower containsString:@"why this ad"] || [lower containsString:@"visit advertiser"]) return YES;
+    if ([lower containsString:@"advertiser"] || [lower containsString:@"advertisement"]) return YES;
+    if ([lower isEqualToString:@"ad"] || [lower hasPrefix:@"ad "] || [lower hasPrefix:@"ad ·"] || [lower hasPrefix:@"ad •"]) return YES;
+    return NO;
 }
 
 static id safeObjectForSelector(id obj, NSString *selName) {
@@ -277,6 +289,85 @@ static void diagObject(id obj, NSString *prefix, NSUInteger depth) {
         }
     }
 #endif
+}
+
+static BOOL viewTreeContainsAdDisclosure(UIView *view, NSUInteger depth, NSMutableArray *hits) {
+    if (!view || depth > 12) return NO;
+
+    NSArray *values = @[
+        view.accessibilityLabel ?: @"",
+        view.accessibilityValue ?: @"",
+        view.accessibilityHint ?: @""
+    ];
+    for (NSString *value in values) {
+        if (stringLooksAdDisclosure(value)) {
+            if (hits) [hits addObject:value];
+            return YES;
+        }
+    }
+
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *text = ((UILabel *)view).text;
+        if (stringLooksAdDisclosure(text)) {
+            if (hits) [hits addObject:text];
+            return YES;
+        }
+    }
+
+    if ([view isKindOfClass:[UIButton class]]) {
+        UIButton *button = (UIButton *)view;
+        NSString *title = [button titleForState:UIControlStateNormal] ?: button.titleLabel.text;
+        if (stringLooksAdDisclosure(title)) {
+            if (hits) [hits addObject:title];
+            return YES;
+        }
+    }
+
+    for (UIView *subview in view.subviews) {
+        if (viewTreeContainsAdDisclosure(subview, depth + 1, hits)) return YES;
+    }
+    return NO;
+}
+
+static void hideRenderedAdCell(UIView *cell, NSString *source) {
+    if (!cell || cell.hidden) return;
+    NSMutableArray *hits = [NSMutableArray array];
+    if (!viewTreeContainsAdDisclosure(cell, 0, hits)) return;
+    diag(@"[ui-ad-hide] source=%@ cell=%@ frame=%@ hits=%@",
+         source, NSStringFromClass([cell class]), NSStringFromCGRect(cell.frame), hits);
+    cell.hidden = YES;
+    cell.alpha = 0.0;
+    cell.userInteractionEnabled = NO;
+}
+
+static void scanCollectionViewForRenderedAds(UICollectionView *collectionView) {
+    @try {
+        for (UICollectionViewCell *cell in [collectionView visibleCells]) {
+            hideRenderedAdCell(cell, @"UICollectionView");
+        }
+    } @catch (NSException *e) {}
+}
+
+static void scanTableViewForRenderedAds(UITableView *tableView) {
+    @try {
+        for (UITableViewCell *cell in [tableView visibleCells]) {
+            hideRenderedAdCell(cell, @"UITableView");
+        }
+    } @catch (NSException *e) {}
+}
+
+static void hook_UICollectionView_layoutSubviews(id self, SEL _cmd) {
+    if (orig_UICollectionView_layoutSubviews) {
+        ((void(*)(id, SEL))orig_UICollectionView_layoutSubviews)(self, _cmd);
+    }
+    if ([self isKindOfClass:[UICollectionView class]]) scanCollectionViewForRenderedAds((UICollectionView *)self);
+}
+
+static void hook_UITableView_layoutSubviews(id self, SEL _cmd) {
+    if (orig_UITableView_layoutSubviews) {
+        ((void(*)(id, SEL))orig_UITableView_layoutSubviews)(self, _cmd);
+    }
+    if ([self isKindOfClass:[UITableView class]]) scanTableViewForRenderedAds((UITableView *)self);
 }
 
 // Helper: get contentsArray from any renderer type
@@ -530,6 +621,12 @@ static void hookYouTubeClasses(void) {
     // Section list filtering (removes promoted sections from feed)
     cls = objc_getClass("YTSectionListViewController");
     if (cls) orig_loadWithModel = hookMethod(cls, @selector(loadWithModel:), (IMP)hook_loadWithModel);
+
+    cls = [UICollectionView class];
+    if (cls) orig_UICollectionView_layoutSubviews = hookMethod(cls, @selector(layoutSubviews), (IMP)hook_UICollectionView_layoutSubviews);
+
+    cls = [UITableView class];
+    if (cls) orig_UITableView_layoutSubviews = hookMethod(cls, @selector(layoutSubviews), (IMP)hook_UITableView_layoutSubviews);
 
     // Diagnostic only. Do not hide from elementData; it creates blank slots.
     cls = objc_getClass("YTIElementRenderer");
