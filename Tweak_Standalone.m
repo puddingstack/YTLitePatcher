@@ -1,5 +1,5 @@
 /*
- * YTLitePatcher v13 - Home feed diagnostics + safer sponsored model filtering
+ * YTLitePatcher v16 - Collapse rendered sponsored feed cells at layout time
  *
  * KEY INSIGHT: We hook YouTube classes in our constructor, BEFORE
  * YTLite.dylib loads. When YTLite's MSHookMessageEx runs later, it
@@ -13,6 +13,8 @@
  * - Observe YTIElementRenderer descriptions without returning nil/empty data,
  *   because filtering at elementData caused blank Home sections.
  * - Broaden loadWithModel filtering using live model introspection.
+ * - Collapse rendered sponsored cells by index path in collection layouts
+ *   so the ad card does not leave a blank slot after being hidden.
  */
 
 #import <Foundation/Foundation.h>
@@ -94,8 +96,13 @@ static IMP hookClassMethod(Class cls, SEL sel, IMP newImp) {
 static IMP orig_loadWithModel = NULL;
 static IMP orig_elementData = NULL;
 static IMP orig_UICollectionView_layoutSubviews = NULL;
+static IMP orig_UICollectionView_reloadData = NULL;
 static IMP orig_UITableView_layoutSubviews = NULL;
 static char kYTLPHiddenAdCellKey;
+static char kYTLPCollapsedAdFramesKey;
+static NSMutableSet *g_hookedLayoutClasses = nil;
+static NSMutableDictionary *g_layoutElementsOrig = nil;
+static NSMutableDictionary *g_layoutItemOrig = nil;
 
 // ============================================================
 // Ad blocking - these hook YouTube classes BEFORE YTLite loads
@@ -330,15 +337,172 @@ static BOOL viewTreeContainsAdDisclosure(UIView *view, NSUInteger depth, NSMutab
     return NO;
 }
 
+static NSString *indexPathKey(NSIndexPath *indexPath) {
+    if (!indexPath) return nil;
+    return [NSString stringWithFormat:@"%ld:%ld", (long)indexPath.section, (long)indexPath.item];
+}
+
+static NSMutableDictionary *collapsedAdFramesForCollectionView(UICollectionView *collectionView, BOOL create) {
+    if (!collectionView) return nil;
+    NSMutableDictionary *frames = objc_getAssociatedObject(collectionView, &kYTLPCollapsedAdFramesKey);
+    if (!frames && create) {
+        frames = [NSMutableDictionary dictionary];
+        objc_setAssociatedObject(collectionView, &kYTLPCollapsedAdFramesKey, frames, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return frames;
+}
+
+static UICollectionView *collectionViewForLayout(id layout) {
+    SEL sel = NSSelectorFromString(@"collectionView");
+    if (!layout || ![layout respondsToSelector:sel]) return nil;
+    @try { return ((UICollectionView *(*)(id, SEL))objc_msgSend)(layout, sel); }
+    @catch (NSException *e) { return nil; }
+}
+
+static UICollectionViewLayoutAttributes *adjustLayoutAttributeForCollapsedAds(UICollectionViewLayoutAttributes *attribute, UICollectionView *collectionView) {
+    if (!attribute || !collectionView) return attribute;
+    if (attribute.representedElementCategory != UICollectionElementCategoryCell) return attribute;
+    NSMutableDictionary *frames = collapsedAdFramesForCollectionView(collectionView, NO);
+    if (frames.count == 0) return attribute;
+
+    UICollectionViewLayoutAttributes *copy = [attribute copy];
+    CGRect frame = copy.frame;
+    NSString *currentKey = indexPathKey(copy.indexPath);
+    CGFloat shift = 0.0;
+    BOOL isCollapsedAd = NO;
+
+    for (NSString *key in frames) {
+        NSDictionary *info = frames[key];
+        CGFloat adY = [info[@"y"] doubleValue];
+        CGFloat adHeight = [info[@"h"] doubleValue];
+        if ([key isEqualToString:currentKey]) {
+            isCollapsedAd = YES;
+        } else if (frame.origin.y > adY) {
+            shift += adHeight;
+        }
+    }
+
+    frame.origin.y -= shift;
+    if (isCollapsedAd) {
+        copy.hidden = YES;
+        copy.alpha = 0.0;
+        frame.size.height = 0.0;
+    }
+    copy.frame = frame;
+    return copy;
+}
+
+static NSArray *adjustLayoutAttributesForCollapsedAds(NSArray *attributes, id layout) {
+    UICollectionView *collectionView = collectionViewForLayout(layout);
+    if (!collectionView || attributes.count == 0) return attributes;
+    NSMutableDictionary *frames = collapsedAdFramesForCollectionView(collectionView, NO);
+    if (frames.count == 0) return attributes;
+
+    NSMutableArray *adjusted = [NSMutableArray arrayWithCapacity:attributes.count];
+    for (UICollectionViewLayoutAttributes *attribute in attributes) {
+        UICollectionViewLayoutAttributes *copy = adjustLayoutAttributeForCollapsedAds(attribute, collectionView);
+        if (copy) [adjusted addObject:copy];
+    }
+    return adjusted;
+}
+
+static IMP originalLayoutImpForSelf(id self, NSMutableDictionary *dict) {
+    if (!self || !dict) return NULL;
+    NSString *className = NSStringFromClass([self class]);
+    @synchronized (dict) {
+        NSValue *value = dict[className];
+        return value ? [value pointerValue] : NULL;
+    }
+}
+
+static NSArray *hook_layoutAttributesForElementsInRect(id self, SEL _cmd, CGRect rect) {
+    IMP orig = originalLayoutImpForSelf(self, g_layoutElementsOrig);
+    NSArray *attributes = orig ? ((NSArray *(*)(id, SEL, CGRect))orig)(self, _cmd, rect) : nil;
+    return adjustLayoutAttributesForCollapsedAds(attributes, self);
+}
+
+static UICollectionViewLayoutAttributes *hook_layoutAttributesForItemAtIndexPath(id self, SEL _cmd, NSIndexPath *indexPath) {
+    IMP orig = originalLayoutImpForSelf(self, g_layoutItemOrig);
+    UICollectionViewLayoutAttributes *attribute = orig ? ((UICollectionViewLayoutAttributes *(*)(id, SEL, NSIndexPath *))orig)(self, _cmd, indexPath) : nil;
+    return adjustLayoutAttributeForCollapsedAds(attribute, collectionViewForLayout(self));
+}
+
+static void initLayoutHookStorage(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        g_hookedLayoutClasses = [NSMutableSet new];
+        g_layoutElementsOrig = [NSMutableDictionary new];
+        g_layoutItemOrig = [NSMutableDictionary new];
+    });
+}
+
+static void hookLayoutMethod(Class cls, SEL sel, IMP newImp, NSMutableDictionary *origDict) {
+    Method method = class_getInstanceMethod(cls, sel);
+    if (!method) return;
+    IMP orig = class_getMethodImplementation(cls, sel);
+    const char *types = method_getTypeEncoding(method);
+    if (!class_addMethod(cls, sel, newImp, types)) {
+        Method directOrInherited = class_getInstanceMethod(cls, sel);
+        orig = method_getImplementation(directOrInherited);
+        method_setImplementation(directOrInherited, newImp);
+    }
+    @synchronized (origDict) {
+        origDict[NSStringFromClass(cls)] = [NSValue valueWithPointer:orig];
+    }
+}
+
+static void hookCollectionLayoutClass(Class cls) {
+    if (!cls) return;
+    initLayoutHookStorage();
+    NSString *className = NSStringFromClass(cls);
+    @synchronized (g_hookedLayoutClasses) {
+        if ([g_hookedLayoutClasses containsObject:className]) return;
+        [g_hookedLayoutClasses addObject:className];
+    }
+    hookLayoutMethod(cls, @selector(layoutAttributesForElementsInRect:), (IMP)hook_layoutAttributesForElementsInRect, g_layoutElementsOrig);
+    hookLayoutMethod(cls, @selector(layoutAttributesForItemAtIndexPath:), (IMP)hook_layoutAttributesForItemAtIndexPath, g_layoutItemOrig);
+    diag(@"[layout-hook] hooked %@", className);
+}
+
+static void markCollectionCellForCollapse(UICollectionView *collectionView, UICollectionViewCell *cell, NSArray *hits) {
+    if (!collectionView || !cell) return;
+    NSIndexPath *indexPath = [collectionView indexPathForCell:cell];
+    NSString *key = indexPathKey(indexPath);
+    if (!key) return;
+    CGRect frame = cell.frame;
+    NSMutableDictionary *frames = collapsedAdFramesForCollectionView(collectionView, YES);
+    if (!frames[key]) {
+        frames[key] = @{@"y": @(frame.origin.y), @"h": @(frame.size.height)};
+        diag(@"[ui-ad-collapse] indexPath=%@ cell=%@ y=%.1f h=%.1f hits=%@",
+             key, NSStringFromClass([cell class]), frame.origin.y, frame.size.height, hits ?: @[]);
+        hookCollectionLayoutClass([collectionView.collectionViewLayout class]);
+        [collectionView.collectionViewLayout invalidateLayout];
+    }
+}
+
+static void unmarkCollectionCellForCollapseIfNeeded(UICollectionView *collectionView, UICollectionViewCell *cell) {
+    if (!collectionView || !cell) return;
+    NSIndexPath *indexPath = [collectionView indexPathForCell:cell];
+    NSString *key = indexPathKey(indexPath);
+    if (!key) return;
+    NSMutableDictionary *frames = collapsedAdFramesForCollectionView(collectionView, NO);
+    if (!frames[key]) return;
+    [frames removeObjectForKey:key];
+    diag(@"[ui-ad-uncollapse] indexPath=%@ cell=%@", key, NSStringFromClass([cell class]));
+    [collectionView.collectionViewLayout invalidateLayout];
+}
+
 static BOOL renderedCellHasAdDisclosure(UIView *cell, NSMutableArray *hits) {
     if (!cell) return NO;
     return viewTreeContainsAdDisclosure(cell, 0, hits);
 }
 
-static void hideRenderedAdCell(UIView *cell, NSString *source, NSMutableArray *hits) {
+static void hideRenderedAdCell(UIView *cell, NSString *source) {
     if (!cell || cell.hidden) return;
+    NSMutableArray *hits = [NSMutableArray array];
+    if (!viewTreeContainsAdDisclosure(cell, 0, hits)) return;
     diag(@"[ui-ad-hide] source=%@ cell=%@ frame=%@ hits=%@",
-         source, NSStringFromClass([cell class]), NSStringFromCGRect(cell.frame), hits ?: @[]);
+         source, NSStringFromClass([cell class]), NSStringFromCGRect(cell.frame), hits);
     cell.hidden = YES;
     cell.alpha = 0.0;
     cell.userInteractionEnabled = NO;
@@ -355,56 +519,32 @@ static void restoreRenderedAdCellIfNeeded(UIView *cell) {
     objc_setAssociatedObject(cell, &kYTLPHiddenAdCellKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-static void collapseVisibleCellsAfterAdFrames(NSArray *visibleCells, NSArray *adRects) {
-    if (adRects.count == 0) return;
-    for (UIView *cell in visibleCells) {
-        if (cell.hidden) continue;
-        CGRect frame = cell.frame;
-        CGFloat shift = 0.0;
-        for (NSValue *value in adRects) {
-            CGRect adFrame = [value CGRectValue];
-            if (frame.origin.y > adFrame.origin.y) {
-                shift += adFrame.size.height;
-            }
-        }
-        if (shift > 0.0) {
-            frame.origin.y -= shift;
-            cell.frame = frame;
-        }
-    }
-}
-
 static void scanCollectionViewForRenderedAds(UICollectionView *collectionView) {
     @try {
-        NSArray *cells = [collectionView visibleCells];
-        NSMutableArray *adRects = [NSMutableArray array];
-        for (UICollectionViewCell *cell in cells) {
+        hookCollectionLayoutClass([collectionView.collectionViewLayout class]);
+        for (UICollectionViewCell *cell in [collectionView visibleCells]) {
             NSMutableArray *hits = [NSMutableArray array];
             if (!renderedCellHasAdDisclosure(cell, hits)) {
+                unmarkCollectionCellForCollapseIfNeeded(collectionView, cell);
                 restoreRenderedAdCellIfNeeded(cell);
                 continue;
             }
-            [adRects addObject:[NSValue valueWithCGRect:cell.frame]];
-            hideRenderedAdCell(cell, @"UICollectionView", hits);
+            markCollectionCellForCollapse(collectionView, cell, hits);
+            hideRenderedAdCell(cell, @"UICollectionView");
         }
-        collapseVisibleCellsAfterAdFrames(cells, adRects);
     } @catch (NSException *e) {}
 }
 
 static void scanTableViewForRenderedAds(UITableView *tableView) {
     @try {
-        NSArray *cells = [tableView visibleCells];
-        NSMutableArray *adRects = [NSMutableArray array];
-        for (UITableViewCell *cell in cells) {
+        for (UITableViewCell *cell in [tableView visibleCells]) {
             NSMutableArray *hits = [NSMutableArray array];
             if (!renderedCellHasAdDisclosure(cell, hits)) {
                 restoreRenderedAdCellIfNeeded(cell);
                 continue;
             }
-            [adRects addObject:[NSValue valueWithCGRect:cell.frame]];
-            hideRenderedAdCell(cell, @"UITableView", hits);
+            hideRenderedAdCell(cell, @"UITableView");
         }
-        collapseVisibleCellsAfterAdFrames(cells, adRects);
     } @catch (NSException *e) {}
 }
 
@@ -413,6 +553,19 @@ static void hook_UICollectionView_layoutSubviews(id self, SEL _cmd) {
         ((void(*)(id, SEL))orig_UICollectionView_layoutSubviews)(self, _cmd);
     }
     if ([self isKindOfClass:[UICollectionView class]]) scanCollectionViewForRenderedAds((UICollectionView *)self);
+}
+
+static void hook_UICollectionView_reloadData(id self, SEL _cmd) {
+    if ([self isKindOfClass:[UICollectionView class]]) {
+        NSMutableDictionary *frames = collapsedAdFramesForCollectionView((UICollectionView *)self, NO);
+        if (frames.count > 0) {
+            [frames removeAllObjects];
+            diag(@"[ui-ad-collapse-clear] reloadData collection=%@", NSStringFromClass([self class]));
+        }
+    }
+    if (orig_UICollectionView_reloadData) {
+        ((void(*)(id, SEL))orig_UICollectionView_reloadData)(self, _cmd);
+    }
 }
 
 static void hook_UITableView_layoutSubviews(id self, SEL _cmd) {
@@ -676,6 +829,9 @@ static void hookYouTubeClasses(void) {
 
     cls = [UICollectionView class];
     if (cls) orig_UICollectionView_layoutSubviews = hookMethod(cls, @selector(layoutSubviews), (IMP)hook_UICollectionView_layoutSubviews);
+
+    cls = [UICollectionView class];
+    if (cls) orig_UICollectionView_reloadData = hookMethod(cls, @selector(reloadData), (IMP)hook_UICollectionView_reloadData);
 
     cls = [UITableView class];
     if (cls) orig_UITableView_layoutSubviews = hookMethod(cls, @selector(layoutSubviews), (IMP)hook_UITableView_layoutSubviews);
