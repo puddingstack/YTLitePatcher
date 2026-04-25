@@ -363,8 +363,8 @@ static void collapseVisibleCellsAfterAdFrames(NSArray *visibleCells, NSArray *ad
         CGFloat shift = 0.0;
         for (NSValue *value in adRects) {
             CGRect adFrame = [value CGRectValue];
-            if (CGRectGetMinY(frame) > CGRectGetMinY(adFrame)) {
-                shift += CGRectGetHeight(adFrame);
+            if (frame.origin.y > adFrame.origin.y) {
+                shift += adFrame.size.height;
             }
         }
         if (shift > 0.0) {
